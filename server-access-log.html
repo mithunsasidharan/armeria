@@ -1,0 +1,498 @@
+
+
+<!DOCTYPE html>
+<!--[if IE 8]><html class="no-js lt-ie9" lang="en" > <![endif]-->
+<!--[if gt IE 8]><!--> <html class="no-js" lang="en" > <!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  
+  <title>Writing an access log &mdash; Armeria 0.58.1 documentation</title>
+  
+
+  
+  
+  
+  
+
+  
+
+  
+  
+    
+
+  
+
+  
+  
+    <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+  
+
+  
+
+  
+    <link rel="stylesheet" href="_static/overrides.css" type="text/css" />
+  
+        <link rel="index" title="Index"
+              href="genindex.html"/>
+        <link rel="search" title="Search" href="search.html"/>
+    <link rel="top" title="Armeria 0.58.1 documentation" href="index.html"/>
+        <link rel="up" title="Writing a server" href="server.html"/>
+        <link rel="next" title="Writing a client" href="client.html"/>
+        <link rel="prev" title="Embedding a servlet container" href="server-servlet.html"/>
+  <script src="_static/center_page.js"></script>
+   
+
+
+  
+  <script src="_static/js/modernizr.min.js"></script>
+
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+   
+  <div class="wy-grid-for-nav">
+
+    
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search">
+          
+
+          
+            <a href="index.html">
+          
+
+          
+            
+            <img src="_static/armeria.png" class="logo" />
+          
+          </a>
+
+          
+            
+            
+              <div class="version">
+                0.58
+              </div>
+            
+          
+
+          
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+
+          
+        </div>
+
+        <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="main navigation">
+          
+            
+            
+              
+            
+            
+              <ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="setup.html">Setting up a project</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="server.html">Writing a server</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="server-basics.html">Server basics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="server-decorator.html">Decorating a service</a></li>
+<li class="toctree-l2"><a class="reference internal" href="server-grpc.html">Running a gRPC service</a></li>
+<li class="toctree-l2"><a class="reference internal" href="server-thrift.html">Running a Thrift service</a></li>
+<li class="toctree-l2"><a class="reference internal" href="server-docservice.html">Browsing and invoking services with <code class="docutils literal highlight highlight-default"><span></span><span class="n">DocService</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="server-rest.html">Running a REST service</a></li>
+<li class="toctree-l2"><a class="reference internal" href="server-http-file.html">Serving static files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="server-servlet.html">Embedding a servlet container</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Writing an access log</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#configuring-logging-framework">Configuring logging framework</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#logback">logback</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#log4j2">log4j2</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#customizing-a-log-format">Customizing a log format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#customizing-an-access-log-writer">Customizing an access log writer</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="client.html">Writing a client</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced.html">Advanced topics</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/line/armeria/releases">Release notes</a></li>
+<li class="toctree-l1"><a class="reference external" href="apidocs/index.html#://">API documentation</a></li>
+<li class="toctree-l1"><a class="reference external" href="xref/index.html#://">Source cross-reference</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/line/armeria/issues?q=label%3Aquestion-answered">Questions and answers</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/line/armeria">Fork me at GitHub</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/line/armeria/blob/master/CONTRIBUTING.md">Contributing</a></li>
+</ul>
+
+            
+          
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+
+      
+      <nav class="wy-nav-top" role="navigation" aria-label="top navigation">
+        
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">Armeria</a>
+        
+      </nav>
+
+
+      
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div role="navigation" aria-label="breadcrumbs navigation">
+
+  <ul class="wy-breadcrumbs">
+    
+      <li><a href="index.html">Docs</a> &raquo;</li>
+        
+          <li><a href="server.html">Writing a server</a> &raquo;</li>
+        
+      <li>Writing an access log</li>
+    
+    
+      <li class="wy-breadcrumbs-aside">
+        
+            
+            
+              <a href="https://github.com/line/armeria/blob/master/site/src/sphinx/server-access-log.rst" class="fa fa-github"> Edit on GitHub</a>
+            
+          
+        
+      </li>
+    
+  </ul>
+
+  
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+            
+  <div class="section" id="writing-an-access-log">
+<span id="server-access-log"></span><h1>Writing an access log<a class="headerlink" href="#writing-an-access-log" title="Permalink to this headline">¶</a></h1>
+<div class="section" id="configuring-logging-framework">
+<h2>Configuring logging framework<a class="headerlink" href="#configuring-logging-framework" title="Permalink to this headline">¶</a></h2>
+<p>To write an access log, you need to configure a logging framework first. The following configurations are
+simple examples of <code class="docutils literal highlight highlight-default"><span></span><span class="n">logback</span><span class="o">.</span><span class="n">xml</span></code> and <code class="docutils literal highlight highlight-default"><span></span><span class="n">log4j2</span><span class="o">.</span><span class="n">xml</span></code> respectively.</p>
+<div class="section" id="logback">
+<h3>logback<a class="headerlink" href="#logback" title="Permalink to this headline">¶</a></h3>
+<div class="highlight-xml"><div class="highlight"><pre><span></span><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+<span class="nt">&lt;configuration&gt;</span>
+  <span class="nt">&lt;appender</span> <span class="na">name=</span><span class="s">&quot;CONSOLE&quot;</span> <span class="na">class=</span><span class="s">&quot;ch.qos.logback.core.ConsoleAppender&quot;</span><span class="nt">&gt;</span>
+    <span class="nt">&lt;encoder&gt;</span>
+      <span class="nt">&lt;pattern&gt;</span>%-4relative [%thread] %-5level %logger{35} - %msg%n<span class="nt">&lt;/pattern&gt;</span>
+    <span class="nt">&lt;/encoder&gt;</span>
+  <span class="nt">&lt;/appender&gt;</span>
+
+  <span class="nt">&lt;appender</span> <span class="na">name=</span><span class="s">&quot;ACCESS&quot;</span> <span class="na">class=</span><span class="s">&quot;ch.qos.logback.core.rolling.RollingFileAppender&quot;</span><span class="nt">&gt;</span>
+    <span class="nt">&lt;file&gt;</span>access.log<span class="nt">&lt;/file&gt;</span>
+    <span class="nt">&lt;rollingPolicy</span> <span class="na">class=</span><span class="s">&quot;ch.qos.logback.core.rolling.TimeBasedRollingPolicy&quot;</span><span class="nt">&gt;</span>
+      <span class="c">&lt;!-- daily rollover --&gt;</span>
+      <span class="nt">&lt;fileNamePattern&gt;</span>access.%d{yyyy-MM-dd}-%i.log<span class="nt">&lt;/fileNamePattern&gt;</span>
+      <span class="c">&lt;!-- each file should be at most 1GB, keep 30 days worth of history, but at most 30GB --&gt;</span>
+      <span class="nt">&lt;maxFileSize&gt;</span>1GB<span class="nt">&lt;/maxFileSize&gt;</span>
+      <span class="nt">&lt;maxHistory&gt;</span>30<span class="nt">&lt;/maxHistory&gt;</span>
+      <span class="nt">&lt;totalSizeCap&gt;</span>30GB<span class="nt">&lt;/totalSizeCap&gt;</span>
+    <span class="nt">&lt;/rollingPolicy&gt;</span>
+    <span class="nt">&lt;encoder&gt;</span>
+      <span class="nt">&lt;pattern&gt;</span>%msg%n<span class="nt">&lt;/pattern&gt;</span>
+    <span class="nt">&lt;/encoder&gt;</span>
+  <span class="nt">&lt;/appender&gt;</span>
+
+  <span class="nt">&lt;logger</span> <span class="na">name=</span><span class="s">&quot;com.linecorp.armeria.logging.access&quot;</span> <span class="na">level=</span><span class="s">&quot;INFO&quot;</span> <span class="na">additivity=</span><span class="s">&quot;false&quot;</span><span class="nt">&gt;</span>
+    <span class="nt">&lt;appender-ref</span> <span class="na">ref=</span><span class="s">&quot;ACCESS&quot;</span><span class="nt">/&gt;</span>
+  <span class="nt">&lt;/logger&gt;</span>
+
+  <span class="nt">&lt;root</span> <span class="na">level=</span><span class="s">&quot;DEBUG&quot;</span><span class="nt">&gt;</span>
+    <span class="nt">&lt;appender-ref</span> <span class="na">ref=</span><span class="s">&quot;CONSOLE&quot;</span><span class="nt">/&gt;</span>
+  <span class="nt">&lt;/root&gt;</span>
+<span class="nt">&lt;/configuration&gt;</span>
+</pre></div>
+</div>
+</div>
+<div class="section" id="log4j2">
+<h3>log4j2<a class="headerlink" href="#log4j2" title="Permalink to this headline">¶</a></h3>
+<div class="highlight-xml"><div class="highlight"><pre><span></span><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+<span class="nt">&lt;Configuration</span> <span class="na">status=</span><span class="s">&quot;WARN&quot;</span><span class="nt">&gt;</span>
+  <span class="nt">&lt;Appenders&gt;</span>
+    <span class="nt">&lt;Console</span> <span class="na">name=</span><span class="s">&quot;CONSOLE&quot;</span> <span class="na">target=</span><span class="s">&quot;SYSTEM_OUT&quot;</span><span class="nt">&gt;</span>
+      <span class="nt">&lt;PatternLayout</span> <span class="na">pattern=</span><span class="s">&quot;%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n&quot;</span><span class="nt">/&gt;</span>
+    <span class="nt">&lt;/Console&gt;</span>
+    <span class="nt">&lt;RollingFile</span> <span class="na">name=</span><span class="s">&quot;ACCESS&quot;</span> <span class="na">fileName=</span><span class="s">&quot;access.log&quot;</span>
+                 <span class="na">filePattern=</span><span class="s">&quot;access.%d{MM-dd-yyyy}-%i.log.gz&quot;</span><span class="nt">&gt;</span>
+      <span class="nt">&lt;PatternLayout&gt;</span>
+        <span class="nt">&lt;Pattern&gt;</span>%m%n<span class="nt">&lt;/Pattern&gt;</span>
+      <span class="nt">&lt;/PatternLayout&gt;</span>
+
+      <span class="nt">&lt;Policies&gt;</span>
+        <span class="c">&lt;!-- daily rollover --&gt;</span>
+        <span class="nt">&lt;TimeBasedTriggeringPolicy/&gt;</span>
+        <span class="c">&lt;!-- each file should be at most 1GB --&gt;</span>
+        <span class="nt">&lt;SizeBasedTriggeringPolicy</span> <span class="na">size=</span><span class="s">&quot;1GB&quot;</span><span class="nt">/&gt;</span>
+      <span class="nt">&lt;/Policies&gt;</span>
+      <span class="c">&lt;!-- keep 30 archives --&gt;</span>
+      <span class="nt">&lt;DefaultRolloverStrategy</span> <span class="na">max=</span><span class="s">&quot;30&quot;</span><span class="nt">/&gt;</span>
+    <span class="nt">&lt;/RollingFile&gt;</span>
+  <span class="nt">&lt;/Appenders&gt;</span>
+
+  <span class="nt">&lt;Loggers&gt;</span>
+    <span class="nt">&lt;Logger</span> <span class="na">name=</span><span class="s">&quot;com.linecorp.armeria.logging.access&quot;</span> <span class="na">level=</span><span class="s">&quot;INFO&quot;</span> <span class="na">additivity=</span><span class="s">&quot;false&quot;</span><span class="nt">&gt;</span>
+      <span class="nt">&lt;AppenderRef</span> <span class="na">ref=</span><span class="s">&quot;ACCESS&quot;</span><span class="nt">/&gt;</span>
+    <span class="nt">&lt;/Logger&gt;</span>
+    <span class="nt">&lt;Root</span> <span class="na">level=</span><span class="s">&quot;DEBUG&quot;</span><span class="nt">&gt;</span>
+      <span class="nt">&lt;AppenderRef</span> <span class="na">ref=</span><span class="s">&quot;CONSOLE&quot;</span><span class="nt">/&gt;</span>
+    <span class="nt">&lt;/Root&gt;</span>
+  <span class="nt">&lt;/Loggers&gt;</span>
+<span class="nt">&lt;/Configuration&gt;</span>
+</pre></div>
+</div>
+</div>
+</div>
+<div class="section" id="customizing-a-log-format">
+<h2>Customizing a log format<a class="headerlink" href="#customizing-a-log-format" title="Permalink to this headline">¶</a></h2>
+<p>Access logging is disabled by default. If you want to enable it, you need to specify an access log writer
+using <a class="reference external" href="apidocs/index.html?com/linecorp/armeria/server/ServerBuilder.html">ServerBuilder</a>. You may use one of the pre-defined log formats.</p>
+<div class="highlight-java"><div class="highlight"><pre><span></span><span class="n">ServerBuilder</span> <span class="n">sb</span> <span class="o">=</span> <span class="k">new</span> <span class="n">ServerBuilder</span><span class="o">();</span>
+<span class="c1">// Use NCSA common log format.</span>
+<span class="n">sb</span><span class="o">.</span><span class="na">accessLogWriter</span><span class="o">(</span><span class="n">AccessLogWriters</span><span class="o">.</span><span class="na">common</span><span class="o">());</span>
+<span class="c1">// Use NCSA combined log format.</span>
+<span class="n">sb</span><span class="o">.</span><span class="na">accessLogWriter</span><span class="o">(</span><span class="n">AccessLogWriters</span><span class="o">.</span><span class="na">combined</span><span class="o">());</span>
+<span class="c1">// Use your own log format.</span>
+<span class="n">sb</span><span class="o">.</span><span class="na">accessLogFormat</span><span class="o">(</span><span class="s">&quot;...log format...&quot;</span><span class="o">);</span>
+<span class="o">...</span>
+</pre></div>
+</div>
+<p>Pre-defined log formats are as follows.</p>
+<table border="1" class="docutils">
+<colgroup>
+<col width="15%" />
+<col width="85%" />
+</colgroup>
+<thead valign="bottom">
+<tr class="row-odd"><th class="head">Name</th>
+<th class="head">Format</th>
+</tr>
+</thead>
+<tbody valign="top">
+<tr class="row-even"><td><code class="docutils literal highlight highlight-default"><span></span><span class="n">common</span></code></td>
+<td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">h</span> <span class="o">%</span><span class="n">l</span> <span class="o">%</span><span class="n">u</span> <span class="o">%</span><span class="n">t</span> <span class="s2">&quot;</span><span class="si">%r</span><span class="s2">&quot;</span> <span class="o">%</span><span class="n">s</span> <span class="o">%</span><span class="n">b</span></code></td>
+</tr>
+<tr class="row-odd"><td><code class="docutils literal highlight highlight-default"><span></span><span class="n">combined</span></code></td>
+<td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">h</span> <span class="o">%</span><span class="n">l</span> <span class="o">%</span><span class="n">u</span> <span class="o">%</span><span class="n">t</span> <span class="s2">&quot;</span><span class="si">%r</span><span class="s2">&quot;</span> <span class="o">%</span><span class="n">s</span> <span class="o">%</span><span class="n">b</span> <span class="s2">&quot;%</span><span class="si">{Referer}</span><span class="s2">i&quot;</span> <span class="s2">&quot;%{User-Agent}i&quot;</span> <span class="s2">&quot;%</span><span class="si">{Cookie}</span><span class="s2">i&quot;</span></code></td>
+</tr>
+</tbody>
+</table>
+<p>Tokens for the log format are listed in the following table.</p>
+<table border="1" class="docutils">
+<colgroup>
+<col width="28%" />
+<col width="19%" />
+<col width="53%" />
+</colgroup>
+<thead valign="bottom">
+<tr class="row-odd"><th class="head">Tokens</th>
+<th class="head">Condition support</th>
+<th class="head">Description</th>
+</tr>
+</thead>
+<tbody valign="top">
+<tr class="row-even"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">h</span></code></td>
+<td>No</td>
+<td>the remote hostname or IP address if DNS
+hostname lookup is not available</td>
+</tr>
+<tr class="row-odd"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">l</span></code></td>
+<td>No</td>
+<td>the remote logname of the user
+(not supported yet, always write <code class="docutils literal highlight highlight-default"><span></span><span class="o">-</span></code>)</td>
+</tr>
+<tr class="row-even"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">u</span></code></td>
+<td>No</td>
+<td>the name of the authenticated remote user
+(not supported yet, always write <code class="docutils literal highlight highlight-default"><span></span><span class="o">-</span></code>)</td>
+</tr>
+<tr class="row-odd"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">t</span></code></td>
+<td>No</td>
+<td>the date, time and time zone that the request
+was received, by default in <code class="docutils literal highlight highlight-default"><span></span><span class="n">strftime</span></code> format
+%d/%b/%Y:%H:%M:%S %z.
+(for example, <code class="docutils literal highlight highlight-default"><span></span><span class="mi">10</span><span class="o">/</span><span class="n">Oct</span><span class="o">/</span><span class="mi">2000</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span><span class="mi">55</span><span class="p">:</span><span class="mi">36</span> <span class="o">-</span><span class="mi">0700</span></code>)</td>
+</tr>
+<tr class="row-even"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">r</span></code></td>
+<td>Yes</td>
+<td>the request line from the client
+(for example, <code class="docutils literal highlight highlight-default"><span></span><span class="n">GET</span> <span class="o">/</span><span class="n">path</span> <span class="n">h2</span></code>)</td>
+</tr>
+<tr class="row-odd"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">s</span></code></td>
+<td>No</td>
+<td>the HTTP status code returned to the client</td>
+</tr>
+<tr class="row-even"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="n">b</span></code></td>
+<td>Yes</td>
+<td>the size of the object returned to the client,
+measured in bytes</td>
+</tr>
+<tr class="row-odd"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="p">{</span><span class="n">HEADER_NAME</span><span class="p">}</span><span class="n">i</span></code></td>
+<td>Yes</td>
+<td>the value of the specified HTTP request header
+name</td>
+</tr>
+<tr class="row-even"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="p">{</span><span class="n">ATTRIBUTE_NAME</span><span class="p">}</span><span class="n">j</span></code></td>
+<td>Yes</td>
+<td>the value of the specified attribute name</td>
+</tr>
+</tbody>
+</table>
+<p>Some tokens can have a condition of the response status code and the log message can be omitted with
+the condition.</p>
+<table border="1" class="docutils">
+<colgroup>
+<col width="52%" />
+<col width="48%" />
+</colgroup>
+<thead valign="bottom">
+<tr class="row-odd"><th class="head">Example of a condition</th>
+<th class="head">Description</th>
+</tr>
+</thead>
+<tbody valign="top">
+<tr class="row-even"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="mi">200</span><span class="n">b</span></code></td>
+<td>Write the size of the object returned to the
+client only if the response code is <code class="docutils literal highlight highlight-default"><span></span><span class="mi">200</span></code>.</td>
+</tr>
+<tr class="row-odd"><td><code class="docutils literal highlight highlight-default"><span></span><span class="o">%</span><span class="mi">200</span><span class="p">,</span><span class="mi">304</span><span class="p">{</span><span class="n">User</span><span class="o">-</span><span class="n">Agent</span><span class="p">}</span><span class="n">i</span></code></td>
+<td>Write <code class="docutils literal highlight highlight-default"><span></span><span class="n">User</span><span class="o">-</span><span class="n">Agent</span></code> header value only if the
+response code is <code class="docutils literal highlight highlight-default"><span></span><span class="mi">200</span></code> or <code class="docutils literal highlight highlight-default"><span></span><span class="mi">304</span></code>.</td>
+</tr>
+<tr class="row-even"><td><code class="docutils literal highlight highlight-default"><span></span>%!200,304{com.example.armeria.Attribute#KEY}j</code></td>
+<td>Write the value of the specified attribute
+only if the response code is neither <code class="docutils literal highlight highlight-default"><span></span><span class="mi">200</span></code>
+nor <code class="docutils literal highlight highlight-default"><span></span><span class="mi">304</span></code>.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="section" id="customizing-an-access-log-writer">
+<h2>Customizing an access log writer<a class="headerlink" href="#customizing-an-access-log-writer" title="Permalink to this headline">¶</a></h2>
+<p>You can specify your own log writer which implements Consumer&lt;<a class="reference external" href="apidocs/index.html?com/linecorp/armeria/common/logging/RequestLog.html">RequestLog</a> &gt;.</p>
+<div class="highlight-java"><div class="highlight"><pre><span></span><span class="n">ServerBuilder</span> <span class="n">sb</span> <span class="o">=</span> <span class="k">new</span> <span class="n">ServerBuilder</span><span class="o">();</span>
+<span class="n">sb</span><span class="o">.</span><span class="na">accessLogWriter</span><span class="o">(</span><span class="n">requestLog</span> <span class="o">-&gt;</span> <span class="o">{</span>
+    <span class="c1">// Write your access log with the given RequestLog instance.</span>
+    <span class="o">....</span>
+<span class="o">});</span>
+</pre></div>
+</div>
+</div>
+</div>
+
+
+           </div>
+           <div class="articleComments">
+            
+           </div>
+          </div>
+          <footer>
+  
+    <div class="rst-footer-buttons" role="navigation" aria-label="footer navigation">
+      
+        <a href="client.html" class="btn btn-neutral float-right" title="Writing a client" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right"></span></a>
+      
+      
+        <a href="server-servlet.html" class="btn btn-neutral" title="Embedding a servlet container" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left"></span> Previous</a>
+      
+    </div>
+  
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>
+        &copy; Copyright 2015-2018, LINE Corporation.
+
+    </p>
+  </div>
+  Built with <a href="http://sphinx-doc.org/">Sphinx</a> using a <a href="https://github.com/snide/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>. 
+
+</footer>
+
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+  
+
+
+  
+
+    <script type="text/javascript">
+        var DOCUMENTATION_OPTIONS = {
+            URL_ROOT:'./',
+            VERSION:'0.58.1',
+            LANGUAGE:'None',
+            COLLAPSE_INDEX:false,
+            FILE_SUFFIX:'.html',
+            HAS_SOURCE:  true,
+            SOURCELINK_SUFFIX: '.txt'
+        };
+    </script>
+      <script type="text/javascript" src="_static/jquery.js"></script>
+      <script type="text/javascript" src="_static/underscore.js"></script>
+      <script type="text/javascript" src="_static/doctools.js"></script>
+
+  
+
+  
+  
+    <script type="text/javascript" src="_static/js/theme.js"></script>
+  
+
+  
+  
+  <script type="text/javascript">
+      jQuery(function () {
+          SphinxRtdTheme.StickyNav.enable();
+      });
+  </script>
+  
+  <div class="github-fork-ribbon-wrapper right">
+    <div class="github-fork-ribbon">
+      <a href="https://github.com/line/armeria">Fork me at GitHub</a>
+    </div>
+  </div>
+  <script type="text/javascript" src="_static/add_badges.js"></script>
+   
+
+
+</body>
+</html>
