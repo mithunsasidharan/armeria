@@ -17,12 +17,12 @@
 package com.linecorp.armeria.client.retry;
 
 import static com.google.common.base.Preconditions.checkArgument;
-import static com.linecorp.armeria.common.util.Functions.voidFunction;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+
+import javax.annotation.Nullable;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
@@ -41,9 +41,8 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpRequestDuplicator;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpResponseDuplicator;
+import com.linecorp.armeria.common.stream.AbortedStreamException;
 import com.linecorp.armeria.internal.HttpHeaderSubscriber;
-
-import io.netty.channel.EventLoop;
 
 /**
  * A {@link Client} decorator that handles failures of an invocation and retries HTTP requests.
@@ -113,14 +112,22 @@ public final class RetryingHttpClient extends RetryingClient<HttpRequest, HttpRe
         final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
         final HttpResponse res = HttpResponse.from(responseFuture);
         final HttpRequestDuplicator reqDuplicator = new HttpRequestDuplicator(req, 0, ctx.eventLoop());
-        doExecute0(ctx, reqDuplicator, responseFuture);
+        doExecute0(ctx, reqDuplicator, req, res, responseFuture);
         return res;
     }
 
     private void doExecute0(ClientRequestContext ctx, HttpRequestDuplicator rootReqDuplicator,
-                            CompletableFuture<HttpResponse> res) {
+                            HttpRequest originalReq, HttpResponse returnedRes,
+                            CompletableFuture<HttpResponse> future) {
+        if (originalReq.completionFuture().isCompletedExceptionally() || returnedRes.isComplete()) {
+            // The request or response has been aborted by the client before it receives a response,
+            // so stop retrying.
+            handleException(ctx, rootReqDuplicator, future, AbortedStreamException.get());
+            return;
+        }
+
         if (!setResponseTimeout(ctx)) {
-            closeOnException(ctx, res, rootReqDuplicator, ResponseTimeoutException.get());
+            handleException(ctx, rootReqDuplicator, future, ResponseTimeoutException.get());
             return;
         }
 
@@ -133,38 +140,40 @@ public final class RetryingHttpClient extends RetryingClient<HttpRequest, HttpRe
 
         final HttpResponseDuplicator resDuplicator =
                 new HttpResponseDuplicator(response, maxSignalLength(ctx.maxResponseLength()), ctx.eventLoop());
-        final ContentPreviewResponse contentPreviewResponse =
-                new ContentPreviewResponse(resDuplicator.duplicateStream(), contentPreviewLength);
-        retryStrategy().shouldRetry(rootReqDuplicator.duplicateStream(), contentPreviewResponse)
-                       .handle(voidFunction((backoffOpt, unused) -> {
-                           if (backoffOpt.isPresent()) {
-                               final long millisAfter =
-                                       useRetryAfter ? getRetryAfterMillis(resDuplicator.duplicateStream())
-                                                     : -1;
-                               resDuplicator.close();
+        retryStrategy().shouldRetry(rootReqDuplicator.duplicateStream(), contentPreviewResponse(resDuplicator))
+                       .whenComplete((backoff, unused) -> {
+                           if (backoff != null) {
+                               final long millisAfter;
+                               if (useRetryAfter) {
+                                   millisAfter = getRetryAfterMillis(contentPreviewResponse(resDuplicator));
+                               } else {
+                                   millisAfter = -1;
+                               }
 
-                               long nextDelay;
-                               try {
-                                   nextDelay = getNextDelay(ctx, backoffOpt.get(), millisAfter);
-                               } catch (Exception e) {
-                                   closeOnException(ctx, res, rootReqDuplicator, e);
+                               final long nextDelay = getNextDelay(ctx, backoff, millisAfter);
+                               if (nextDelay < 0) {
+                                   finishRetryWithCurrentResponse(
+                                           ctx, rootReqDuplicator, future, resDuplicator);
                                    return;
                                }
 
-                               final EventLoop eventLoop = ctx.contextAwareEventLoop();
-                               if (nextDelay <= 0) {
-                                   eventLoop.execute(() -> doExecute0(ctx, rootReqDuplicator, res));
-                               } else {
-                                   eventLoop.schedule(
-                                           () -> doExecute0(ctx, rootReqDuplicator, res),
-                                           nextDelay, TimeUnit.MILLISECONDS);
-                               }
+                               resDuplicator.close();
+                               scheduleNextRetry(
+                                       ctx, cause -> handleException(ctx, rootReqDuplicator, future, cause),
+                                       () -> doExecute0(ctx, rootReqDuplicator, originalReq,
+                                                        returnedRes, future),
+                                       nextDelay);
                            } else {
-                               onRetryingComplete(ctx);
-                               res.complete(resDuplicator.duplicateStream(true));
-                               rootReqDuplicator.close();
+                               finishRetryWithCurrentResponse(ctx, rootReqDuplicator, future, resDuplicator);
                            }
-                       }));
+                       });
+    }
+
+    private static void handleException(ClientRequestContext ctx, HttpRequestDuplicator rootReqDuplicator,
+                                        CompletableFuture<HttpResponse> future, Throwable cause) {
+        onRetryingComplete(ctx);
+        future.completeExceptionally(cause);
+        rootReqDuplicator.close();
     }
 
     private static int maxSignalLength(long maxResponseLength) {
@@ -174,10 +183,14 @@ public final class RetryingHttpClient extends RetryingClient<HttpRequest, HttpRe
         return (int) maxResponseLength;
     }
 
+    private ContentPreviewResponse contentPreviewResponse(HttpResponseDuplicator resDuplicator) {
+        return new ContentPreviewResponse(resDuplicator.duplicateStream(), contentPreviewLength);
+    }
+
     private static long getRetryAfterMillis(HttpResponse res) {
         final HttpHeaders headers = getHttpHeaders(res);
         long millisAfter = -1;
-        String value = headers.get(HttpHeaderNames.RETRY_AFTER);
+        final String value = headers.get(HttpHeaderNames.RETRY_AFTER);
         if (value != null) {
             try {
                 millisAfter = Duration.ofSeconds(Integer.parseInt(value)).toMillis();
@@ -201,15 +214,16 @@ public final class RetryingHttpClient extends RetryingClient<HttpRequest, HttpRe
         final HttpHeaderSubscriber subscriber = new HttpHeaderSubscriber(future);
         res.completionFuture().whenComplete(subscriber);
         res.subscribe(subscriber);
-        // Neither blocks here nor throws an exception because it already has headers.
-        return future.join();
+        // Future does not block here because it is already complete.
+        return future.handle((headers, thrown) -> thrown != null ? HttpHeaders.EMPTY_HEADERS : headers).join();
     }
 
-    private static void closeOnException(ClientRequestContext ctx,
-                                         CompletableFuture<HttpResponse> res,
-                                         HttpRequestDuplicator rootReqDuplicator, Throwable cause) {
+    private static void finishRetryWithCurrentResponse(ClientRequestContext ctx,
+                                                       HttpRequestDuplicator rootReqDuplicator,
+                                                       CompletableFuture<HttpResponse> res,
+                                                       HttpResponseDuplicator resDuplicator) {
         onRetryingComplete(ctx);
-        res.completeExceptionally(cause);
+        res.complete(resDuplicator.duplicateStream(true));
         rootReqDuplicator.close();
     }
 
@@ -217,15 +231,12 @@ public final class RetryingHttpClient extends RetryingClient<HttpRequest, HttpRe
 
         private final int contentPreviewLength;
         private int contentLength;
+        @Nullable
         private Subscription subscription;
 
         ContentPreviewResponse(HttpResponse delegate, int contentPreviewLength) {
             super(delegate);
-            if (contentPreviewLength == 0) {
-                this.contentPreviewLength = Integer.MAX_VALUE;
-            } else {
-                this.contentPreviewLength = contentPreviewLength;
-            }
+            this.contentPreviewLength = contentPreviewLength;
         }
 
         @Override
@@ -239,6 +250,7 @@ public final class RetryingHttpClient extends RetryingClient<HttpRequest, HttpRe
                 final int dataLength = ((HttpData) obj).length();
                 contentLength += dataLength;
                 if (contentLength >= contentPreviewLength) {
+                    assert subscription != null;
                     subscription.cancel();
                 }
             }

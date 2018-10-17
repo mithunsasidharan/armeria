@@ -22,12 +22,13 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
+import javax.annotation.Nullable;
+
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
 import com.linecorp.armeria.common.util.CompletionActions;
 
-import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.ImmediateEventExecutor;
 
 /**
@@ -43,23 +44,32 @@ public class DeferredStreamMessage<T> extends AbstractStreamMessage<T> {
             subscriptionUpdater = AtomicReferenceFieldUpdater.newUpdater(
             DeferredStreamMessage.class, SubscriptionImpl.class, "subscription");
 
-    @SuppressWarnings({ "AtomicFieldUpdaterIssues", "rawtypes" })
+    @SuppressWarnings("rawtypes")
     private static final AtomicReferenceFieldUpdater<DeferredStreamMessage, StreamMessage> delegateUpdater =
             AtomicReferenceFieldUpdater.newUpdater(
                     DeferredStreamMessage.class, StreamMessage.class, "delegate");
 
-    @SuppressWarnings({ "AtomicFieldUpdaterIssues", "rawtypes" })
+    @SuppressWarnings("rawtypes")
     private static final AtomicIntegerFieldUpdater<DeferredStreamMessage>
             subscribedToDelegateUpdater =
             AtomicIntegerFieldUpdater.newUpdater(
                     DeferredStreamMessage.class, "subscribedToDelegate");
 
+    @SuppressWarnings("rawtypes")
+    private static final AtomicIntegerFieldUpdater<DeferredStreamMessage>
+            abortPendingUpdater =
+            AtomicIntegerFieldUpdater.newUpdater(
+                    DeferredStreamMessage.class, "abortPending");
+
+    @Nullable
     @SuppressWarnings("unused") // Updated only via delegateUpdater
     private volatile StreamMessage<T> delegate;
 
     // Only accessed from subscription's executor.
+    @Nullable
     private Subscription delegateSubscription;
 
+    @Nullable
     @SuppressWarnings("unused") // Updated only via subscriptionUpdater
     private volatile SubscriptionImpl subscription;
 
@@ -69,7 +79,8 @@ public class DeferredStreamMessage<T> extends AbstractStreamMessage<T> {
     // Only accessed from subscription's executor.
     private long pendingDemand;
 
-    private volatile boolean abortPending;
+    @SuppressWarnings("unused")
+    private volatile int abortPending; // 0 - false, 1 - true
 
     // Only accessed from subscription's executor.
     private boolean cancelPending;
@@ -87,7 +98,7 @@ public class DeferredStreamMessage<T> extends AbstractStreamMessage<T> {
             throw new IllegalStateException("delegate set already");
         }
 
-        if (abortPending) {
+        if (abortPending != 0) {
             delegate.abort();
         }
 
@@ -179,6 +190,7 @@ public class DeferredStreamMessage<T> extends AbstractStreamMessage<T> {
     @Override
     void cancel() {
         // A user cannot access subscription without subscribing.
+        final SubscriptionImpl subscription = this.subscription;
         assert subscription != null;
 
         if (subscription.needsDirectInvocation()) {
@@ -194,7 +206,14 @@ public class DeferredStreamMessage<T> extends AbstractStreamMessage<T> {
             try {
                 delegateSubscription.cancel();
             } finally {
-                subscription.clearSubscriber();
+                // Clear the subscriber when we become sure that the delegate will not produce events anymore.
+                final StreamMessage<T> delegate = this.delegate;
+                assert delegate != null;
+                if (delegate.isComplete()) {
+                    subscription.clearSubscriber();
+                } else {
+                    delegate.completionFuture().whenComplete((u1, u2) -> subscription.clearSubscriber());
+                }
             }
         } else {
             cancelPending = true;
@@ -236,21 +255,16 @@ public class DeferredStreamMessage<T> extends AbstractStreamMessage<T> {
             return;
         }
 
-        final EventExecutor executor = subscription.executor();
-        final boolean withPooledObjects = subscription.withPooledObjects();
-
-        final Subscriber<T> delegateSubscriber = new ForwardingSubscriber();
-
-        if (executor == null) {
-            delegate.subscribe(delegateSubscriber, withPooledObjects);
-        } else {
-            delegate.subscribe(delegateSubscriber, executor, withPooledObjects);
-        }
+        delegate.subscribe(new ForwardingSubscriber(),
+                           subscription.executor(),
+                           subscription.withPooledObjects());
     }
 
     @Override
     public void abort() {
-        abortPending = true;
+        if (!abortPendingUpdater.compareAndSet(this, 0, 1)) {
+            return;
+        }
 
         final SubscriptionImpl newSubscription = new SubscriptionImpl(
                 this, AbortingSubscriber.get(), ImmediateEventExecutor.INSTANCE, false);

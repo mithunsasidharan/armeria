@@ -66,25 +66,20 @@ final class Http1ResponseDecoder extends HttpResponseDecoder implements ChannelI
 
     @Override
     HttpResponseWrapper addResponse(
-            int id, HttpRequest req, DecodedHttpResponse res, RequestLogBuilder logBuilder,
+            int id, @Nullable HttpRequest req, DecodedHttpResponse res, RequestLogBuilder logBuilder,
             long responseTimeoutMillis, long maxContentLength) {
 
         final HttpResponseWrapper resWrapper =
                 super.addResponse(id, req, res, logBuilder, responseTimeoutMillis, maxContentLength);
 
         resWrapper.completionFuture().whenComplete((unused, cause) -> {
-            if (cause != null) {
-                // Ensure that the resWrapper is closed.
-                // This is needed in case the response is aborted by the client.
-                resWrapper.close(cause);
+            // Cancel timeout future and abort the request if it exists.
+            resWrapper.onSubscriptionCancelled();
 
+            if (cause != null) {
                 // Disconnect when the response has been closed with an exception because there's no way
                 // to recover from it in HTTP/1.
                 channel().close();
-            } else {
-                // Ensure that the resWrapper is closed.
-                // This is needed in case the response is aborted by the client.
-                resWrapper.close();
             }
         });
 
@@ -152,7 +147,7 @@ final class Http1ResponseDecoder extends HttpResponseDecoder implements ChannelI
                             state = State.NEED_DATA_OR_TRAILING_HEADERS;
                         }
 
-                        res.scheduleTimeout(ctx);
+                        res.scheduleTimeout(channel().eventLoop());
                         res.write(ArmeriaHttpUtil.toArmeria(nettyRes));
                     } else {
                         failWithUnexpectedMessageType(ctx, msg);
@@ -177,6 +172,7 @@ final class Http1ResponseDecoder extends HttpResponseDecoder implements ChannelI
                         final ByteBuf data = content.content();
                         final int dataLength = data.readableBytes();
                         if (dataLength > 0) {
+                            assert res != null;
                             final long maxContentLength = res.maxContentLength();
                             if (maxContentLength > 0 && res.writtenBytes() > maxContentLength - dataLength) {
                                 fail(ctx, ContentTooLargeException.get());
@@ -188,6 +184,7 @@ final class Http1ResponseDecoder extends HttpResponseDecoder implements ChannelI
 
                         if (msg instanceof LastHttpContent) {
                             final HttpResponseWrapper res = removeResponse(resId++);
+                            assert res != null;
                             assert this.res == res;
                             this.res = null;
 

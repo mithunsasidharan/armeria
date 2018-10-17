@@ -58,7 +58,7 @@ final class ManagedConnectorFactory implements Function<String, Connector> {
 
         // Create the connector with our protocol handler. Tomcat will call ProtocolHandler.setAdapter()
         // on its startup with the Coyote Adapter which gives an access to Tomcat's HTTP service pipeline.
-        final Class<?> protocolType = TomcatService.TOMCAT_HANDLER.protocolHandlerClass();
+        final Class<?> protocolType = TomcatService.PROTOCOL_HANDLER_CLASS;
 
         final Connector connector = new Connector(protocolType.getName());
         // We do not really open a port - just trying to stop the Connector from complaining.
@@ -68,7 +68,7 @@ final class ManagedConnectorFactory implements Function<String, Connector> {
 
         // Retrieve the components configured by newServer(), so we can use it in checkConfiguration().
         final Service service = server.findServices()[0];
-        final Engine engine = TomcatUtil.engine(service);
+        final Engine engine = TomcatUtil.engine(service, hostname);
         final StandardHost host = (StandardHost) engine.findChildren()[0];
         final Context context = (Context) host.findChildren()[0];
 
@@ -132,7 +132,7 @@ final class ManagedConnectorFactory implements Function<String, Connector> {
         final Context ctx;
         try {
             ctx = (Context) Class.forName(host.getContextClass(), true, getClass().getClassLoader())
-                                 .newInstance();
+                                 .getDeclaredConstructor().newInstance();
         } catch (Exception e) {
             throw new TomcatServiceException("failed to create a new context: " + config, e);
         }
@@ -191,7 +191,7 @@ final class ManagedConnectorFactory implements Function<String, Connector> {
         }
 
         // Check if the engine has not been changed.
-        final Container actualEngine = TomcatUtil.engine(expectedService);
+        final Container actualEngine = TomcatUtil.engine(expectedService, expectedHost.getName());
         if (actualEngine != expectedEngine) {
             throw new TomcatServiceException(
                     "A configurator should never change the engine of the default service.");

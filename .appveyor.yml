@@ -7,19 +7,25 @@ build:
   verbosity: detailed
 
 build_script:
-  - gradlew.bat --no-daemon --stacktrace checkstyle test build
+  - gradlew.bat --no-daemon --stacktrace checkstyle check build
 
 test: off
 
 cache:
+  - "%USERPROFILE%\\AppData\\Local\\Yarn\\cache"
   - "%USERPROFILE%\\.gradle\\wrapper\\dists"
   - "%USERPROFILE%\\.gradle\\caches\\jars-3"
   - "%USERPROFILE%\\.gradle\\caches\\modules-2"
   - "%USERPROFILE%\\.gradle\\caches\\package-lists"
+  - "%USERPROFILE%\\.gradle\\caches\\sphinx-binary"
 
 environment:
-  JAVA_HOME: C:\Program Files\Java\jdk1.8.0
-  GRADLE_OPTS: -Xmx1280m
+  JAVA_HOME: C:\Program Files\Java\jdk10
 
 matrix:
   fast_finish: true
+
+notifications:
+  - provider: Slack
+    incoming_webhook:
+      secure: uDUySAYLk8RjAL6ZAWd9K/hP9rV1/yYPz26CybZOPFZB7Le4v7/x2byv3HkwEJtxAYFi0RjeVJG4UF9oZfyqfbnyOW4vGZ3KYUJBT1EidEE=

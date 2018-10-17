@@ -22,7 +22,6 @@ import static org.awaitility.Awaitility.await;
 
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -39,6 +38,7 @@ import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.EventLoop;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCounted;
+import io.netty.util.concurrent.EventExecutor;
 
 public abstract class AbstractStreamMessageAndWriterTest extends AbstractStreamMessageTest {
 
@@ -52,15 +52,15 @@ public abstract class AbstractStreamMessageAndWriterTest extends AbstractStreamM
     /**
      * Makes sure {@link Subscriber#onComplete()} is always invoked after
      * {@link Subscriber#onSubscribe(Subscription)} even if
-     * {@link StreamMessage#subscribe(Subscriber, Executor)}  is called from non-{@link EventLoop}.
+     * {@link StreamMessage#subscribe(Subscriber, EventExecutor)} is called from non-{@link EventLoop}.
      */
     @Test
     public void onSubscribeBeforeOnComplete() throws Exception {
         final BlockingQueue<String> queue = new LinkedTransferQueue<>();
         // Repeat to increase the chance of reproduction.
         for (int i = 0; i < 8192; i++) {
-            StreamMessageAndWriter<Integer> stream = newStreamWriter(TEN_INTEGERS);
-            eventLoop().execute(stream::close);
+            final StreamMessageAndWriter<Integer> stream = newStreamWriter(TEN_INTEGERS);
+            eventLoop.get().execute(stream::close);
             stream.subscribe(new Subscriber<Object>() {
                 @Override
                 public void onSubscribe(Subscription s) {
@@ -82,7 +82,7 @@ public abstract class AbstractStreamMessageAndWriterTest extends AbstractStreamM
                 public void onComplete() {
                     queue.add("onComplete");
                 }
-            }, eventLoop());
+            }, eventLoop.get());
 
             assertThat(queue.poll(5, TimeUnit.SECONDS)).isEqualTo("onSubscribe");
             assertThat(queue.poll(5, TimeUnit.SECONDS)).isEqualTo("onComplete");
@@ -91,7 +91,7 @@ public abstract class AbstractStreamMessageAndWriterTest extends AbstractStreamM
 
     @Test
     public void rejectReferenceCounted() {
-        AbstractReferenceCounted item = new AbstractReferenceCounted() {
+        final AbstractReferenceCounted item = new AbstractReferenceCounted() {
             @Override
             protected void deallocate() {}
 
@@ -100,27 +100,59 @@ public abstract class AbstractStreamMessageAndWriterTest extends AbstractStreamM
                 return this;
             }
         };
-        StreamMessageAndWriter<Object> stream = newStreamWriter(ImmutableList.of(item));
+        final StreamMessageAndWriter<Object> stream = newStreamWriter(ImmutableList.of(item));
         assertThatThrownBy(() -> stream.write(item)).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     public void releaseWhenWritingToClosedStream_ByteBuf() {
-        StreamMessageAndWriter<Object> stream = newStreamWriter(ImmutableList.of());
-        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer();
+        final StreamMessageAndWriter<Object> stream = newStreamWriter(ImmutableList.of());
+        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer().retain();
         stream.close();
 
-        await().untilAsserted(() -> assertThat(stream.write(buf)).isFalse());
+        await().untilAsserted(() -> assertThat(stream.isOpen()).isFalse());
+        assertThat(stream.tryWrite(buf)).isFalse();
+        assertThat(buf.refCnt()).isOne();
+        assertThatThrownBy(() -> stream.write(buf)).isInstanceOf(ClosedPublisherException.class);
+        assertThat(buf.refCnt()).isZero();
+    }
+
+    @Test
+    public void releaseWhenWritingToClosedStream_ByteBuf_Supplier() {
+        final StreamMessageAndWriter<Object> stream = newStreamWriter(ImmutableList.of());
+        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer().retain();
+        stream.close();
+
+        await().untilAsserted(() -> assertThat(stream.isOpen()).isFalse());
+        assertThat(stream.tryWrite(() -> buf)).isFalse();
+        assertThat(buf.refCnt()).isOne();
+        assertThatThrownBy(() -> stream.write(() -> buf)).isInstanceOf(ClosedPublisherException.class);
         assertThat(buf.refCnt()).isZero();
     }
 
     @Test
     public void releaseWhenWritingToClosedStream_HttpData() {
-        StreamMessageAndWriter<Object> stream = newStreamWriter(ImmutableList.of());
-        final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), true);
+        final StreamMessageAndWriter<Object> stream = newStreamWriter(ImmutableList.of());
+        final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), true).retain();
         stream.close();
 
-        await().untilAsserted(() -> assertThat(stream.write(data)).isFalse());
+        await().untilAsserted(() -> assertThat(stream.isOpen()).isFalse());
+        assertThat(stream.tryWrite(data)).isFalse();
+        assertThat(data.refCnt()).isOne();
+        assertThatThrownBy(() -> stream.write(data)).isInstanceOf(ClosedPublisherException.class);
+        assertThat(data.refCnt()).isZero();
+    }
+
+    @Test
+    public void releaseWhenWritingToClosedStream_HttpData_Supplier() {
+        final StreamMessageAndWriter<Object> stream = newStreamWriter(ImmutableList.of());
+        final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), true).retain();
+        stream.close();
+
+        await().untilAsserted(() -> assertThat(stream.isOpen()).isFalse());
+        assertThat(stream.tryWrite(() -> data)).isFalse();
+        assertThat(data.refCnt()).isOne();
+        assertThatThrownBy(() -> stream.write(() -> data)).isInstanceOf(ClosedPublisherException.class);
         assertThat(data.refCnt()).isZero();
     }
 }

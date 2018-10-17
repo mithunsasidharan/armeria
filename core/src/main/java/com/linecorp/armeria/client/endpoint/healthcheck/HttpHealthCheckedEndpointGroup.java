@@ -17,13 +17,18 @@ package com.linecorp.armeria.client.endpoint.healthcheck;
 
 import static java.util.Objects.requireNonNull;
 
+import java.net.StandardProtocolFamily;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 import com.linecorp.armeria.client.ClientFactory;
+import com.linecorp.armeria.client.ClientOptionsBuilder;
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.client.HttpClient;
+import com.linecorp.armeria.client.HttpClientBuilder;
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.SessionProtocol;
 
@@ -70,6 +75,7 @@ public final class HttpHealthCheckedEndpointGroup extends HealthCheckedEndpointG
 
     private final SessionProtocol protocol;
     private final String healthCheckPath;
+    private final Function<? super ClientOptionsBuilder, ClientOptionsBuilder> configurator;
 
     /**
      * Creates a new {@link HttpHealthCheckedEndpointGroup} instance.
@@ -78,28 +84,48 @@ public final class HttpHealthCheckedEndpointGroup extends HealthCheckedEndpointG
                                    EndpointGroup delegate,
                                    SessionProtocol protocol,
                                    String healthCheckPath,
-                                   Duration healthCheckRetryInterval) {
+                                   Duration healthCheckRetryInterval,
+                                   Function<? super ClientOptionsBuilder, ClientOptionsBuilder> configurator) {
         super(clientFactory, delegate, healthCheckRetryInterval);
         this.protocol = requireNonNull(protocol, "protocol");
         this.healthCheckPath = requireNonNull(healthCheckPath, "healthCheckPath");
+        this.configurator = requireNonNull(configurator, "configurator");
         init();
     }
 
     @Override
     protected EndpointHealthChecker createEndpointHealthChecker(Endpoint endpoint) {
-        return new HttpEndpointHealthChecker(clientFactory(), endpoint, protocol, healthCheckPath);
+        return new HttpEndpointHealthChecker(clientFactory(), endpoint, protocol, healthCheckPath,
+                                             configurator);
     }
 
     private static final class HttpEndpointHealthChecker implements EndpointHealthChecker {
         private final HttpClient httpClient;
         private final String healthCheckPath;
 
-        private HttpEndpointHealthChecker(ClientFactory clientFactory,
-                                          Endpoint endpoint,
-                                          SessionProtocol protocol,
-                                          String healthCheckPath) {
-            httpClient = HttpClient.of(clientFactory,
-                                       protocol.uriText() + "://" + endpoint.authority());
+        private HttpEndpointHealthChecker(
+                ClientFactory clientFactory, Endpoint endpoint,
+                SessionProtocol protocol, String healthCheckPath,
+                Function<? super ClientOptionsBuilder, ClientOptionsBuilder> configurator) {
+
+            final String scheme = protocol.uriText();
+            final String ipAddr = endpoint.ipAddr();
+            final HttpClientBuilder builder;
+            if (ipAddr == null) {
+                builder = new HttpClientBuilder(scheme + "://" + endpoint.authority());
+            } else {
+                final int port = endpoint.port(protocol.defaultPort());
+                if (endpoint.ipFamily() == StandardProtocolFamily.INET) {
+                    builder = new HttpClientBuilder(scheme + "://" + ipAddr + ':' + port);
+                } else {
+                    builder = new HttpClientBuilder(scheme + "://[" + ipAddr + "]:" + port);
+                }
+                builder.setHttpHeader(HttpHeaderNames.AUTHORITY, endpoint.authority());
+            }
+
+            httpClient = builder.factory(clientFactory)
+                                .options(configurator.apply(new ClientOptionsBuilder()).build())
+                                .build();
             this.healthCheckPath = healthCheckPath;
         }
 
@@ -107,7 +133,7 @@ public final class HttpHealthCheckedEndpointGroup extends HealthCheckedEndpointG
         public CompletableFuture<Boolean> isHealthy(Endpoint endpoint) {
             return httpClient.get(healthCheckPath)
                              .aggregate()
-                             .thenApply(message -> message.status().equals(HttpStatus.OK));
+                             .thenApply(message -> HttpStatus.OK.equals(message.status()));
         }
     }
 }

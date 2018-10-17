@@ -16,12 +16,16 @@
 
 package com.linecorp.armeria.server;
 
+import javax.annotation.Nullable;
+
 import com.linecorp.armeria.common.DefaultHttpRequest;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpObject;
+import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.internal.InboundTrafficController;
 
+import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.EventLoop;
 
 final class DecodedHttpRequest extends DefaultHttpRequest {
@@ -32,8 +36,13 @@ final class DecodedHttpRequest extends DefaultHttpRequest {
     private final boolean keepAlive;
     private final InboundTrafficController inboundTrafficController;
     private final long defaultMaxRequestLength;
+    @Nullable
     private ServiceRequestContext ctx;
     private long transferredBytes;
+
+    @Nullable
+    private HttpResponse response;
+    private boolean isResponseAborted;
 
     DecodedHttpRequest(EventLoop eventLoop, int id, int streamId, HttpHeaders headers, boolean keepAlive,
                        InboundTrafficController inboundTrafficController, long defaultMaxRequestLength) {
@@ -90,8 +99,8 @@ final class DecodedHttpRequest extends DefaultHttpRequest {
     }
 
     @Override
-    public boolean write(HttpObject obj) {
-        final boolean published = super.write(obj);
+    public boolean tryWrite(HttpObject obj) {
+        final boolean published = super.tryWrite(obj);
         if (published && obj instanceof HttpData) {
             final int length = ((HttpData) obj).length();
             inboundTrafficController.inc(length);
@@ -106,6 +115,35 @@ final class DecodedHttpRequest extends DefaultHttpRequest {
         if (obj instanceof HttpData) {
             final int length = ((HttpData) obj).length();
             inboundTrafficController.dec(length);
+        }
+    }
+
+    /**
+     * Sets the specified {@link HttpResponse} which responds to this request. This is always called
+     * by the {@link HttpServerHandler} after the handler gets the {@link HttpResponse} from a {@link Service}.
+     */
+    void setResponse(HttpResponse response) {
+        if (isResponseAborted) {
+            // This means that we already tried to close the request, so abort the response immediately.
+            if (!response.isComplete()) {
+                response.abort();
+            }
+        } else {
+            this.response = response;
+        }
+    }
+
+    /**
+     * Aborts the {@link HttpResponse} which responds to this request if it exists.
+     *
+     * @see Http2RequestDecoder#onRstStreamRead(ChannelHandlerContext, int, long)
+     */
+    void abortResponse(Throwable cause) {
+        isResponseAborted = true;
+        // Try to close the request first, then abort the response if it is already closed.
+        if (!tryClose(cause) &&
+            response != null && !response.isComplete()) {
+            response.abort();
         }
     }
 }

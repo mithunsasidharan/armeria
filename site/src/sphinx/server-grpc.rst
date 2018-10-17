@@ -1,12 +1,8 @@
 .. _gRPC: https://grpc.io/
 .. _gRPC-Web: https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md
 .. _gRPC-Web-Client: https://github.com/improbable-eng/grpc-web
-.. _GrpcSerializationFormats: https://github.com/line/armeria/blob/master/grpc/src/main/java/com/linecorp/armeria/common/grpc/GrpcSerializationFormats.java
-.. _GrpcService: apidocs/index.html?com/linecorp/armeria/server/grpc/GrpcService.html
-.. _GrpcServiceBuilder: apidocs/index.html?com/linecorp/armeria/server/grpc/GrpcServiceBuilder.html
 .. _protobuf-gradle-plugin: https://github.com/google/protobuf-gradle-plugin
 .. _Protobuf-JSON: https://developers.google.com/protocol-buffers/docs/proto3#json
-.. _ServerBuilder: apidocs/index.html?com/linecorp/armeria/server/ServerBuilder.html
 .. _the gRPC-Java README: https://github.com/grpc/grpc-java/blob/master/README.md#download
 
 .. _server-grpc:
@@ -75,39 +71,45 @@ Our implementation would look like the following:
 ``GrpcService``
 ---------------
 
-Once you've finished the implementation of the service, you need to build a GrpcService_ using
-a GrpcServiceBuilder_ and add it to the ServerBuilder_:
+Once you've finished the implementation of the service, you need to build a :api:`GrpcService` using
+a :api:`GrpcServiceBuilder` and add it to the :api:`ServerBuilder`:
 
 .. code-block:: java
 
+    import com.linecorp.armeria.server.Server;
+    import com.linecorp.armeria.server.ServerBuilder;
+    import com.linecorp.armeria.server.grpc.GrpcServiceBuilder;
+
     ServerBuilder sb = new ServerBuilder();
     ...
-    sb.serviceUnder("/",
-                    new GrpcServiceBuilder().addService(new MyHelloService())
-                                            .build());
+    sb.service(new GrpcServiceBuilder().addService(new MyHelloService())
+                                       .build());
     ...
     Server server = sb.build();
     server.start();
 
-Note that we bound the GrpcService_ under ``/``, which is the catch-all path mapping. This is required for
-compatibility with the official gRPC client. If you are going to add non-gRPC services as well, make sure
-they are added *before* the GrpcService_ so that it does not take precedence.
+.. note::
+
+    We bound the :api:`GrpcService` without specifying any path mappings. It is because :api:`GrpcService`
+    implements :api:`ServiceWithPathMappings`, which dynamically provides path mappings by itself.
 
 ``gRPC-Web``
 ------------
 
-GrpcService_ suppors the gRPC-Web_ protocol, a small modification to the gRPC_ wire format that can be used from
-a browser. To enable it for a GrpcService_, add the web formats from GrpcSerializationFormats_ to the
-GrpcServiceBuilder_. It is usually convenient to just pass GrpcSerializationFormats_.values().
+:api:`GrpcService` supports the gRPC-Web_ protocol, a small modification to the gRPC_ wire format
+that can be used from a browser. To enable it for a :api:`GrpcService`, add the web formats from
+:api:`GrpcSerializationFormats` to the :api:`GrpcServiceBuilder`. It is usually convenient
+to just pass ``GrpcSerializationFormats.values()``.
 
 .. code-block:: java
 
+    import com.linecorp.armeria.server.grpc.GrpcSerializationFormats;
+
     ServerBuilder sb = new ServerBuilder();
     ...
-    sb.serviceUnder("/",
-                    new GrpcServiceBuilder().addService(new MyHelloService())
-                                            .supportedSerializationFormats(GrpcSerializationFormats.values())
-                                            .build());
+    sb.service(new GrpcServiceBuilder().addService(new MyHelloService())
+                                       .supportedSerializationFormats(GrpcSerializationFormats.values())
+                                       .build());
     ...
     Server server = sb.build();
     server.start();
@@ -116,21 +118,50 @@ The server will support both native gRPC_ and gRPC-Web_ from the same endpoint. 
 gRPC-Web-Client_ to access the service from a browser. gRPC-Web_ does not support RPC methods with streaming
 requests.
 
+If the origin of the Javascript and API server are different, gRPC-Web-Client_ first sends ``preflight``
+requests by the HTTP ``OPTIONS`` method, in order to determine whether the actual request is safe to send
+in terms of CORS. Armeria provides :api:`CorsService` to handle this requests, so you need to decorate it when
+you build a :api:`GrpcService`:
+
+.. code-block:: java
+
+    import com.linecorp.armeria.server.cors.CorsServiceBuilder;
+
+    ServerBuilder sb = new ServerBuilder();
+    ...
+
+    final CorsServiceBuilder corsBuilder =
+            CorsServiceBuilder.forOrigin("http://foo.com")
+                              .allowRequestMethods(HttpMethod.POST) // Allow POST method.
+                              // Allow Content-type and X-GRPC-WEB headers.
+                              .allowRequestHeaders(HttpHeaderNames.CONTENT_TYPE,
+                                                   HttpHeaderNames.of("X-GRPC-WEB"));
+
+    sb.service(new GrpcServiceBuilder().addService(new MyHelloService())
+                                       .supportedSerializationFormats(GrpcSerializationFormats.values())
+                                       .build(), corsBuilder.newDecorator());
+    ...
+    Server server = sb.build();
+    server.start();
+
+Please refer to `Cross-Origin Resource Sharing (CORS) <https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS>`_
+by MDN for more information.
+
 Unframed requests
 -----------------
 
-GrpcService_ supports serving unary RPC methods (no streaming request or response) without gRPC_ wire format
-framing. This can be useful for gradually migrating an existing HTTP POST based API to gRPC_. As GrpcService_
-supports both binary protobuf and Protobuf-JSON_, either legacy protobuf or JSON APIs can be used.
+:api:`GrpcService` supports serving unary RPC methods (no streaming request or response) without
+gRPC_ wire format framing. This can be useful for gradually migrating an existing HTTP POST based API to gRPC_.
+As :api:`GrpcService` supports both binary protobuf and Protobuf-JSON_, either legacy protobuf or JSON APIs
+can be used.
 
 .. code-block:: java
 
     ServerBuilder sb = new ServerBuilder();
     ...
-    sb.serviceUnder("/",
-                    new GrpcServiceBuilder().addService(new MyHelloService())
-                                            .enableUnframedRequests(true)
-                                            .build());
+    sb.service(new GrpcServiceBuilder().addService(new MyHelloService())
+                                       .enableUnframedRequests(true)
+                                       .build());
     ...
     Server server = sb.build();
     server.start();
@@ -142,11 +173,14 @@ body.
 Blocking service implementation
 -------------------------------
 
-Unlike upstream gRPC-java, Armeria does not run service logic in a separate threadpool. If your service
-implementation requires blocking, either run the individual blocking logic in a threadpool, or just wrap the
+Unlike upstream gRPC-java, Armeria does not run service logic in a separate thread pool. If your service
+implementation requires blocking, either run the individual blocking logic in a thread pool, or just wrap the
 entire service implementation in ``RequestContext.current().blockingTaskExecutor().submit``
 
 .. code-block:: java
+
+    import com.linecorp.armeria.common.RequestContext;
+    import com.linecorp.armeria.server.ServiceRequestContext;
 
     public class MyHelloService extends HelloServiceGrpc.HelloServiceImplBase {
         @Override

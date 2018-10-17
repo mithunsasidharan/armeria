@@ -20,6 +20,8 @@ import static io.netty.handler.codec.http2.Http2Error.INTERNAL_ERROR;
 import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
 import static io.netty.handler.codec.http2.Http2Exception.connectionError;
 
+import javax.annotation.Nullable;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -60,18 +62,17 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
 
     @Override
     HttpResponseWrapper addResponse(
-            int id, HttpRequest req, DecodedHttpResponse res, RequestLogBuilder logBuilder,
+            int id, @Nullable HttpRequest req, DecodedHttpResponse res, RequestLogBuilder logBuilder,
             long responseTimeoutMillis, long maxContentLength) {
 
         final HttpResponseWrapper resWrapper =
                 super.addResponse(id, req, res, logBuilder, responseTimeoutMillis, maxContentLength);
 
         resWrapper.completionFuture().whenCompleteAsync((unused, cause) -> {
-            if (cause != null) {
-                // Ensure that the resWrapper is closed.
-                // This is needed in case the response is aborted by the client.
-                resWrapper.close(cause);
+            // Cancel timeout future and abort the request if it exists.
+            resWrapper.onSubscriptionCancelled();
 
+            if (cause != null) {
                 // We are not closing the connection but just send a RST_STREAM,
                 // so we have to remove the response manually.
                 removeResponse(id);
@@ -80,13 +81,13 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
                 final int streamId = idToStreamId(id);
                 if (conn.streamMayHaveExisted(streamId)) {
                     final ChannelHandlerContext ctx = channel().pipeline().lastContext();
-                    encoder.writeRstStream(ctx, streamId, Http2Error.CANCEL.code(), ctx.newPromise());
-                    ctx.flush();
+                    if (ctx != null) {
+                        encoder.writeRstStream(ctx, streamId, Http2Error.CANCEL.code(), ctx.newPromise());
+                        ctx.flush();
+                    } else {
+                        // The pipeline has been cleaned up due to disconnection.
+                    }
                 }
-            } else {
-                // Ensure that the resWrapper is closed.
-                // This is needed in case the response is aborted by the client.
-                resWrapper.close();
             }
         }, channel().eventLoop());
         return resWrapper;
@@ -129,7 +130,7 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
     @Override
     public void onHeadersRead(ChannelHandlerContext ctx, int streamId, Http2Headers headers, int padding,
                               boolean endOfStream) throws Http2Exception {
-        HttpResponseWrapper res = getResponse(streamIdToId(streamId), endOfStream);
+        final HttpResponseWrapper res = getResponse(streamIdToId(streamId), endOfStream);
         if (res == null) {
             if (conn.streamMayHaveExisted(streamId)) {
                 if (logger.isDebugEnabled()) {
@@ -143,10 +144,15 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
                                   streamId);
         }
 
-        final HttpHeaders converted = ArmeriaHttpUtil.toArmeria(headers);
+        final HttpHeaders converted = ArmeriaHttpUtil.toArmeria(headers, endOfStream);
         try {
-            res.scheduleTimeout(ctx);
-            res.write(converted);
+            // If this tryWrite() returns false, it means the response stream has been closed due to
+            // disconnection or by the response consumer. We do not need to handle such cases here because
+            // it will be notified to the response consumer anyway.
+            if (!res.tryWrite(converted)) {
+                // Schedule only when the response stream is still open.
+                res.scheduleTimeout(ctx.channel().eventLoop());
+            }
         } catch (Throwable t) {
             res.close(t);
             throw connectionError(INTERNAL_ERROR, t, "failed to consume a HEADERS frame");
@@ -194,7 +200,10 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
         }
 
         try {
-            res.write(HttpData.of(data));
+            // If this tryWrite() returns false, it means the response stream has been closed due to
+            // disconnection or by the response consumer. We do not need to handle such cases here because
+            // it will be notified to the response consumer anyway.
+            res.tryWrite(HttpData.of(data));
         } catch (Throwable t) {
             res.close(t);
             throw connectionError(INTERNAL_ERROR, t, "failed to consume a DATA frame");
@@ -236,10 +245,10 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
                                boolean exclusive) {}
 
     @Override
-    public void onPingRead(ChannelHandlerContext ctx, ByteBuf data) {}
+    public void onPingRead(ChannelHandlerContext ctx, long data) {}
 
     @Override
-    public void onPingAckRead(ChannelHandlerContext ctx, ByteBuf data) {}
+    public void onPingAckRead(ChannelHandlerContext ctx, long data) {}
 
     @Override
     public void onGoAwayRead(ChannelHandlerContext ctx, int lastStreamId, long errorCode, ByteBuf debugData) {}

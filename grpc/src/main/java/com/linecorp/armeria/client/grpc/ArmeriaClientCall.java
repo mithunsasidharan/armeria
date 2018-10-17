@@ -16,12 +16,13 @@
 
 package com.linecorp.armeria.client.grpc;
 
-import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import javax.annotation.Nullable;
 
@@ -35,8 +36,8 @@ import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpRequestWriter;
 import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.SerializationFormat;
+import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.util.SafeCloseable;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer.ByteBufOrStream;
@@ -47,6 +48,7 @@ import com.linecorp.armeria.internal.grpc.GrpcMessageMarshaller;
 import com.linecorp.armeria.internal.grpc.HttpStreamReader;
 import com.linecorp.armeria.internal.grpc.TimeoutHeaderUtil;
 import com.linecorp.armeria.internal.grpc.TransportStatusListener;
+import com.linecorp.armeria.unsafe.grpc.GrpcUnsafeBufferUtil;
 
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;
@@ -66,28 +68,41 @@ import io.netty.buffer.ByteBuf;
 class ArmeriaClientCall<I, O> extends ClientCall<I, O>
         implements ArmeriaMessageDeframer.Listener, TransportStatusListener {
 
-    private static final Runnable NO_OP = () -> { };
+    private static final Runnable NO_OP = () -> {
+    };
 
     private static final Metadata EMPTY_METADATA = new Metadata();
 
     private static final Logger logger = LoggerFactory.getLogger(ArmeriaClientCall.class);
 
+    @SuppressWarnings("rawtypes")
+    private static final AtomicIntegerFieldUpdater<ArmeriaClientCall> pendingMessagesUpdater =
+            AtomicIntegerFieldUpdater.newUpdater(ArmeriaClientCall.class, "pendingMessages");
+
     private final ClientRequestContext ctx;
     private final Client<HttpRequest, HttpResponse> httpClient;
     private final HttpRequestWriter req;
+    private final MethodDescriptor<I, O> method;
     private final CallOptions callOptions;
     private final ArmeriaMessageFramer messageFramer;
     private final GrpcMessageMarshaller<I, O> marshaller;
     private final CompressorRegistry compressorRegistry;
     private final DecompressorRegistry decompressorRegistry;
     private final HttpStreamReader responseReader;
+    private final boolean unsafeWrapResponseBuffers;
     @Nullable
     private final Executor executor;
+    private final String advertisedEncodingsHeader;
 
     // Effectively final, only set once during start()
+    @Nullable
     private Listener<O> listener;
 
+    @Nullable
+    private O firstResponse;
     private boolean cancelCalled;
+
+    private volatile int pendingMessages;
 
     ArmeriaClientCall(
             ClientRequestContext ctx,
@@ -100,24 +115,33 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
             CompressorRegistry compressorRegistry,
             DecompressorRegistry decompressorRegistry,
             SerializationFormat serializationFormat,
-            @Nullable MessageMarshaller jsonMarshaller) {
+            @Nullable MessageMarshaller jsonMarshaller,
+            boolean unsafeWrapResponseBuffers,
+            String advertisedEncodingsHeader) {
         this.ctx = ctx;
         this.httpClient = httpClient;
         this.req = req;
+        this.method = method;
         this.callOptions = callOptions;
         this.compressorRegistry = compressorRegistry;
         this.decompressorRegistry = decompressorRegistry;
-        this.messageFramer = new ArmeriaMessageFramer(ctx.alloc(), maxOutboundMessageSizeBytes);
-        this.marshaller = new GrpcMessageMarshaller<>(
+        this.unsafeWrapResponseBuffers = unsafeWrapResponseBuffers;
+        this.advertisedEncodingsHeader = advertisedEncodingsHeader;
+        messageFramer = new ArmeriaMessageFramer(ctx.alloc(), maxOutboundMessageSizeBytes);
+        marshaller = new GrpcMessageMarshaller<>(
                 ctx.alloc(), serializationFormat, method, jsonMarshaller,
-                // TODO(anuraag): Consider adding a GrpcClientOption for this after checking the server-side
-                // works / makes sense.
-                false);
+                unsafeWrapResponseBuffers);
         responseReader = new HttpStreamReader(
                 decompressorRegistry,
                 new ArmeriaMessageDeframer(this, maxInboundMessageSizeBytes, ctx.alloc()),
                 this);
         executor = callOptions.getExecutor();
+        req.completionFuture().whenComplete((unused1, unused2) -> {
+            if (!ctx.log().isAvailable(RequestLogAvailability.REQUEST_CONTENT)) {
+                // Can reach here if the request stream was empty.
+                ctx.logBuilder().requestContent(GrpcLogUtil.rpcRequest(method), null);
+            }
+        });
     }
 
     @Override
@@ -140,13 +164,14 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
         prepareHeaders(req.headers(), compressor);
         listener = responseListener;
         final HttpResponse res;
-        try {
+        try (SafeCloseable ignored = ctx.push()) {
             res = httpClient.execute(ctx, req);
         } catch (Exception e) {
             close(Status.fromThrowable(e));
             return;
         }
         res.subscribe(responseReader, ctx.eventLoop(), true);
+        res.completionFuture().whenCompleteAsync(responseReader, ctx.eventLoop());
     }
 
     @Override
@@ -160,6 +185,14 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
 
     @Override
     public void cancel(@Nullable String message, @Nullable Throwable cause) {
+        if (ctx.eventLoop().inEventLoop()) {
+            doCancel(message, cause);
+        } else {
+            ctx.eventLoop().submit(() -> doCancel(message, cause));
+        }
+    }
+
+    private void doCancel(@Nullable String message, @Nullable Throwable cause) {
         if (message == null && cause == null) {
             cause = new CancellationException("Cancelled without a message or cause");
             logger.warn("Cancelling without a message or cause is suboptimal", cause);
@@ -181,35 +214,72 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
 
     @Override
     public void halfClose() {
-        req.close();
+        if (ctx.eventLoop().inEventLoop()) {
+            req.close();
+        } else {
+            ctx.eventLoop().submit((Runnable) req::close);
+        }
     }
 
     @Override
     public void sendMessage(I message) {
+        pendingMessagesUpdater.incrementAndGet(this);
+        if (ctx.eventLoop().inEventLoop()) {
+            doSendMessage(message);
+        } else {
+            ctx.eventLoop().submit(() -> doSendMessage(message));
+        }
+    }
+
+    @Override
+    public boolean isReady() {
+        return pendingMessages == 0;
+    }
+
+    private void doSendMessage(I message) {
         try {
-            ByteBuf serialized = marshaller.serializeRequest(message);
+            if (!ctx.log().isAvailable(RequestLogAvailability.REQUEST_CONTENT)) {
+                ctx.logBuilder().requestContent(GrpcLogUtil.rpcRequest(method, message), null);
+            }
+            final ByteBuf serialized = marshaller.serializeRequest(message);
             req.write(messageFramer.writePayload(serialized));
+            req.onDemand(() -> {
+                if (pendingMessagesUpdater.decrementAndGet(this) == 0) {
+                    try (SafeCloseable ignored = ctx.push()) {
+                        listener.onReady();
+                    } catch (Throwable t) {
+                        close(Status.fromThrowable(t));
+                    }
+                }
+            });
         } catch (Throwable t) {
             cancel(null, t);
         }
     }
 
     @Override
-    public void setMessageCompression(boolean enabled) {
-        checkState(req != null, "Not started");
+    public synchronized void setMessageCompression(boolean enabled) {
         messageFramer.setMessageCompression(enabled);
     }
 
     @Override
     public void messageRead(ByteBufOrStream message) {
         try {
-            O msg = marshaller.deserializeResponse(message);
-            try (SafeCloseable ignored = RequestContext.push(ctx)) {
+            final O msg = marshaller.deserializeResponse(message);
+            if (firstResponse == null) {
+                firstResponse = msg;
+            }
+
+            if (unsafeWrapResponseBuffers && message.buf() != null) {
+                GrpcUnsafeBufferUtil.storeBuffer(message.buf(), msg, ctx);
+            }
+
+            try (SafeCloseable ignored = ctx.push()) {
                 listener.onMessage(msg);
             }
         } catch (Throwable t) {
             req.close(Status.fromThrowable(t).asException());
-            throw (t instanceof RuntimeException) ? (RuntimeException) t : new RuntimeException(t);
+            throw t instanceof RuntimeException ? (RuntimeException) t : new RuntimeException(t);
         }
     }
 
@@ -227,9 +297,8 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
         if (compressor != Identity.NONE) {
             headers.set(GrpcHeaderNames.GRPC_ENCODING, compressor.getMessageEncoding());
         }
-        String advertisedEncodings = String.join(",", decompressorRegistry.getAdvertisedMessageEncodings());
-        if (!advertisedEncodings.isEmpty()) {
-            headers.add(GrpcHeaderNames.GRPC_ACCEPT_ENCODING, advertisedEncodings);
+        if (!advertisedEncodingsHeader.isEmpty()) {
+            headers.add(GrpcHeaderNames.GRPC_ACCEPT_ENCODING, advertisedEncodingsHeader);
         }
         headers.add(GrpcHeaderNames.GRPC_TIMEOUT,
                     TimeoutHeaderUtil.toHeaderValue(
@@ -237,19 +306,22 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
     }
 
     private void close(Status status) {
+        ctx.logBuilder().responseContent(GrpcLogUtil.rpcResponse(status, firstResponse), null);
+        req.abort();
         responseReader.cancel();
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+
+        try (SafeCloseable ignored = ctx.push()) {
             listener.onClose(status, EMPTY_METADATA);
         }
-        ctx.logBuilder().responseContent(GrpcLogUtil.rpcResponse(status), null);
+
         notifyExecutor();
     }
 
     /**
      * Armeria does not support {@link CallOptions} set by the user, however gRPC stubs set an {@link Executor}
      * within blocking stubs which is used to notify the stub when processing is finished. It's unclear why
-     * the stubs use a loop and {@link java.util.concurrent.Future#isDone()} instead of just blocking on
-     * {@link java.util.concurrent.Future#get}, but we make sure to run the {@link Executor} so the stub can
+     * the stubs use a loop and {@link Future#isDone()} instead of just blocking on
+     * {@link Future#get}, but we make sure to run the {@link Executor} so the stub can
      * be notified of completion.
      */
     private void notifyExecutor() {

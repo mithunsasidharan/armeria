@@ -24,7 +24,10 @@ import java.lang.annotation.Target;
 
 /**
  * Specifies a media type which would be consumed by the service method or class.
+ *
+ * @deprecated Use {@link Consumes}.
  */
+@Deprecated
 @Repeatable(ConsumeTypes.class)
 @Retention(RetentionPolicy.RUNTIME)
 @Target({ ElementType.TYPE, ElementType.METHOD })

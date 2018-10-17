@@ -15,7 +15,9 @@
  */
 package com.linecorp.armeria.server;
 
+import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.fail;
 
 import java.io.BufferedReader;
@@ -26,7 +28,11 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -57,8 +63,10 @@ import com.linecorp.armeria.testing.internal.AnticipatedException;
 import com.linecorp.armeria.testing.server.ServerRule;
 
 import io.micrometer.core.instrument.MeterRegistry;
+import io.netty.channel.ChannelOption;
 import io.netty.handler.codec.http.HttpStatusClass;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
+import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.util.concurrent.Future;
 
@@ -75,6 +83,7 @@ public class ServerTest {
         @Override
         protected void configure(ServerBuilder sb) throws Exception {
 
+            sb.channelOption(ChannelOption.SO_BACKLOG, 1024);
             sb.meterRegistry(PrometheusMeterRegistries.newRegistry());
 
             final Service<HttpRequest, HttpResponse> immediateResponseOnIoThread =
@@ -95,8 +104,8 @@ public class ServerTest {
             final Service<HttpRequest, HttpResponse> lazyResponseNotOnIoThread = new EchoService() {
                 @Override
                 protected HttpResponse echo(AggregatedHttpMessage aReq) {
-                    CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
-                    HttpResponse res = HttpResponse.from(responseFuture);
+                    final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
+                    final HttpResponse res = HttpResponse.from(responseFuture);
                     asyncExecutorGroup.schedule(
                             () -> super.echo(aReq), processDelayMillis, TimeUnit.MILLISECONDS)
                                       .addListener((Future<HttpResponse> future) ->
@@ -171,6 +180,12 @@ public class ServerTest {
         testInvocation0("/delayed");
     }
 
+    @Test
+    public void testChannelOptions() throws Exception {
+        assertThat(server.server().serverBootstrap().config()
+                         .options().get(ChannelOption.SO_BACKLOG)).isEqualTo(1024);
+    }
+
     private static void testInvocation0(String path) throws IOException {
         try (CloseableHttpClient hc = HttpClients.createMinimal()) {
             final HttpPost req = new HttpPost(server.uri(path));
@@ -214,12 +229,12 @@ public class ServerTest {
         try (Socket socket = new Socket()) {
             socket.setSoTimeout((int) (idleTimeoutMillis * 4));
             socket.connect(server.httpSocketAddress());
-            long connectedNanos = System.nanoTime();
+            final long connectedNanos = System.nanoTime();
             //read until EOF
             while (socket.getInputStream().read() != -1) {
                 continue;
             }
-            long elapsedTimeMillis = TimeUnit.MILLISECONDS.convert(
+            final long elapsedTimeMillis = TimeUnit.MILLISECONDS.convert(
                     System.nanoTime() - connectedNanos, TimeUnit.NANOSECONDS);
             assertThat(elapsedTimeMillis).isGreaterThan((long) (idleTimeoutMillis * 0.9));
         }
@@ -230,19 +245,19 @@ public class ServerTest {
         try (Socket socket = new Socket()) {
             socket.setSoTimeout((int) (idleTimeoutMillis * 4));
             socket.connect(server.httpSocketAddress());
-            PrintWriter outWriter = new PrintWriter(socket.getOutputStream(), false);
+            final PrintWriter outWriter = new PrintWriter(socket.getOutputStream(), false);
             outWriter.print("POST / HTTP/1.1\r\n");
             outWriter.print("Connection: Keep-Alive\r\n");
             outWriter.print("\r\n");
             outWriter.flush();
 
-            long lastWriteNanos = System.nanoTime();
+            final long lastWriteNanos = System.nanoTime();
             //read until EOF
             while (socket.getInputStream().read() != -1) {
                 continue;
             }
 
-            long elapsedTimeMillis = TimeUnit.MILLISECONDS.convert(
+            final long elapsedTimeMillis = TimeUnit.MILLISECONDS.convert(
                     System.nanoTime() - lastWriteNanos, TimeUnit.NANOSECONDS);
             assertThat(elapsedTimeMillis).isGreaterThan((long) (idleTimeoutMillis * 0.9));
         }
@@ -257,7 +272,7 @@ public class ServerTest {
         try (Socket socket = new Socket()) {
             socket.setSoTimeout((int) (idleTimeoutMillis * 4));
             socket.connect(server.httpSocketAddress());
-            PrintWriter outWriter = new PrintWriter(socket.getOutputStream(), false);
+            final PrintWriter outWriter = new PrintWriter(socket.getOutputStream(), false);
 
             // Send a request to a buggy service whose invoke() raises an exception.
             // If the server handled the exception correctly (i.e. responded with 500 Internal Server Error and
@@ -272,13 +287,13 @@ public class ServerTest {
             outWriter.print("\r\n");
             outWriter.flush();
 
-            long lastWriteNanos = System.nanoTime();
+            final long lastWriteNanos = System.nanoTime();
             //read until EOF
             while (socket.getInputStream().read() != -1) {
                 continue;
             }
 
-            long elapsedTimeMillis = TimeUnit.MILLISECONDS.convert(
+            final long elapsedTimeMillis = TimeUnit.MILLISECONDS.convert(
                     System.nanoTime() - lastWriteNanos, TimeUnit.NANOSECONDS);
             assertThat(elapsedTimeMillis).isGreaterThan((long) (idleTimeoutMillis * 0.9));
         }
@@ -300,13 +315,52 @@ public class ServerTest {
         testSimple("WHOA / HTTP/1.1", "HTTP/1.1 405 Method Not Allowed");
     }
 
+    @Test
+    public void duplicatedPort() {
+        final Server duplicatedPortServer = new ServerBuilder()
+                .http(server.httpPort())
+                .service("/", (ctx, res) -> HttpResponse.of(""))
+                .build();
+        assertThatThrownBy(() -> duplicatedPortServer.start().join())
+                .hasCauseInstanceOf(IOException.class);
+    }
+
+    @Test
+    public void defaultStartStopExecutor() {
+        final Server server = ServerTest.server.server();
+        final Queue<Thread> threads = new LinkedTransferQueue<>();
+        server.addListener(new ThreadRecordingServerListener(threads));
+
+        threads.add(server.stop().thenApply(unused -> Thread.currentThread()).join());
+        threads.add(server.start().thenApply(unused -> Thread.currentThread()).join());
+
+        threads.forEach(t -> assertThat(t.getName()).startsWith("globalEventExecutor"));
+    }
+
+    @Test
+    public void customStartStopExecutor() {
+        final Queue<Thread> threads = new LinkedTransferQueue<>();
+        final String prefix = getClass().getName() + "#customStartStopExecutor";
+        final ExecutorService executor = Executors.newSingleThreadExecutor(new DefaultThreadFactory(prefix));
+        final Server server = new ServerBuilder()
+                .startStopExecutor(executor)
+                .service("/", (ctx, req) -> HttpResponse.of(200))
+                .serverListener(new ThreadRecordingServerListener(threads))
+                .build();
+
+        threads.add(server.start().thenApply(unused -> Thread.currentThread()).join());
+        threads.add(server.stop().thenApply(unused -> Thread.currentThread()).join());
+
+        threads.forEach(t -> assertThat(t.getName()).startsWith(prefix));
+    }
+
     private static void testSimple(
             String reqLine, String expectedStatusLine, String... expectedHeaders) throws Exception {
 
         try (Socket socket = new Socket()) {
             socket.setSoTimeout((int) (idleTimeoutMillis * 4));
             socket.connect(server.httpSocketAddress());
-            PrintWriter outWriter = new PrintWriter(socket.getOutputStream(), false);
+            final PrintWriter outWriter = new PrintWriter(socket.getOutputStream(), false);
 
             outWriter.print(reqLine);
             outWriter.print("\r\n");
@@ -315,14 +369,14 @@ public class ServerTest {
             outWriter.print("\r\n");
             outWriter.flush();
 
-            BufferedReader in = new BufferedReader(new InputStreamReader(
+            final BufferedReader in = new BufferedReader(new InputStreamReader(
                     socket.getInputStream(), StandardCharsets.US_ASCII));
 
             assertThat(in.readLine()).isEqualTo(expectedStatusLine);
             // Read till the end of the connection.
-            List<String> headers = new ArrayList<>();
+            final List<String> headers = new ArrayList<>();
             for (;;) {
-                String line = in.readLine();
+                final String line = in.readLine();
                 if (line == null) {
                     break;
                 }
@@ -351,6 +405,38 @@ public class ServerTest {
             return HttpResponse.of(
                     HttpHeaders.of(HttpStatus.OK),
                     aReq.content());
+        }
+    }
+
+    private static class ThreadRecordingServerListener implements ServerListener {
+        private final Queue<Thread> threads;
+
+        ThreadRecordingServerListener(Queue<Thread> threads) {
+            this.threads = requireNonNull(threads, "threads");
+        }
+
+        @Override
+        public void serverStarting(Server server) {
+            recordThread();
+        }
+
+        @Override
+        public void serverStarted(Server server) {
+            recordThread();
+        }
+
+        @Override
+        public void serverStopping(Server server) {
+            recordThread();
+        }
+
+        @Override
+        public void serverStopped(Server server) {
+            recordThread();
+        }
+
+        private void recordThread() {
+            threads.add(Thread.currentThread());
         }
     }
 }

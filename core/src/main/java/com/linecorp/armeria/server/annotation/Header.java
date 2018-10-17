@@ -21,15 +21,31 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
+import com.linecorp.armeria.internal.DefaultValues;
+
 /**
- * Annotation for mapping an HTTP request header onto a method parameter.
+ * Annotation for mapping an HTTP request header onto the following elements.
+ *
+ * <p>a parameter of an annotated service method</p>
+ *
+ * <p>or, a field of a request bean</p>
+ *
+ * <p>or, a constructor with only one parameter of a request bean</p>
+ *
+ * <p>or, a method with only one parameter of a request bean</p>
+ *
+ * <p>or, a parameter of a request bean constructor</p>
+ *
+ * <p>or, a parameter of a request bean method</p>
+ *
+ * <p>(See: {@link RequestConverter} and {@link RequestConverterFunction})</p>
  */
 @Retention(RetentionPolicy.RUNTIME)
-@Target(ElementType.PARAMETER)
+@Target({ ElementType.PARAMETER, ElementType.FIELD, ElementType.METHOD, ElementType.CONSTRUCTOR })
 public @interface Header {
 
     /**
      * The name of the HTTP request header to bind to.
      */
-    String value();
+    String value() default DefaultValues.UNSPECIFIED;
 }

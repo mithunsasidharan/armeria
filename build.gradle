@@ -3,8 +3,8 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath 'com.google.gradle:osdetector-gradle-plugin:1.4.0'
-        classpath 'io.spring.gradle:dependency-management-plugin:1.0.4.RELEASE'
+        classpath 'com.google.gradle:osdetector-gradle-plugin:1.6.0'
+        classpath 'io.spring.gradle:dependency-management-plugin:1.0.6.RELEASE'
     }
 }
 
@@ -24,22 +24,29 @@ apply from: "${rootDir}/gradle/scripts/build-flags.gradle"
 allprojects {
     // Add common JVM options such as max memory and leak detection.
     tasks.withType(JavaForkOptions) {
-        // Use larger heap when test coverage is enabled.
-        maxHeapSize = project.hasFlags('coverage') ? '384m' : '128m'
-
-        // Use verbose exception reporting for easier debugging.
-        systemProperties 'com.linecorp.armeria.verboseExceptions': 'true'
+        maxHeapSize = '512m'
 
         // Enable leak detection when '-Pleak' option is specified.
-        if (project.hasProperty('leak')) {
+        if (rootProject.hasProperty('leak')) {
             systemProperties 'io.netty.leakDetectionLevel': 'paranoid'
+        }
+    }
+
+    tasks.withType(Test) {
+        // Do not omit stack frames for easier tracking.
+        jvmArgs '-XX:-OmitStackTraceInFastThrow'
+        // Use verbose exception/response reporting for easier debugging.
+        systemProperty 'com.linecorp.armeria.verboseExceptions', 'true'
+        systemProperty 'com.linecorp.armeria.verboseResponses', 'true'
+        // Pass special system property to tell our tests that we are measuring coverage.
+        if (project.hasFlags('coverage')) {
+            systemProperty 'com.linecorp.armeria.testing.coverage', 'true'
         }
     }
 }
 
 // Configure all Java projects
 configure(projectsWithFlags('java')) {
-
     // Common dependencies
     dependencies {
         // All projects currently require ':core' (except itself)
@@ -86,10 +93,16 @@ configure(projectsWithFlags('java')) {
         testCompile 'net.javacrumbs.json-unit:json-unit-fluent'
         testCompile 'org.awaitility:awaitility'
         testRuntime 'org.checkerframework:checker-compat-qual' // Required by guava-testlib
-        testCompile 'org.hamcrest:hamcrest-library'
         testCompile 'org.assertj:assertj-core'
         testCompile 'org.mockito:mockito-core'
         testCompile 'org.apache.httpcomponents:httpclient'
+    }
+
+    // Target Java 8.
+    tasks.withType(JavaCompile) {
+        if (JavaVersion.current() >= JavaVersion.VERSION_1_9) {
+            options.compilerArgs += ['--release', '8']
+        }
     }
 }
 
@@ -107,5 +120,12 @@ allprojects {
             exclude '**/internal/**'
             exclude '**/thrift/v1/**'
         }
+    }
+}
+
+// Require to use JDK 10 when releasing.
+tasks.release.doFirst {
+    if (JavaVersion.current() != JavaVersion.VERSION_1_10) {
+        throw new IllegalStateException("You must release using JDK 10.");
     }
 }

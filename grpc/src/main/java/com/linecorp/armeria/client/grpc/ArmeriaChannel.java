@@ -40,7 +40,6 @@ import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.util.ReleasableHolder;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageFramer;
-import com.linecorp.armeria.internal.grpc.GrpcLogUtil;
 
 import io.grpc.CallOptions;
 import io.grpc.Channel;
@@ -70,7 +69,9 @@ class ArmeriaChannel extends Channel implements ClientBuilderParams {
     private final SessionProtocol sessionProtocol;
     private final Endpoint endpoint;
     private final SerializationFormat serializationFormat;
+    @Nullable
     private final MessageMarshaller jsonMarshaller;
+    private final String advertisedEncodingsHeader;
 
     ArmeriaChannel(ClientBuilderParams params,
                    Client<HttpRequest, HttpResponse> httpClient,
@@ -86,18 +87,20 @@ class ArmeriaChannel extends Channel implements ClientBuilderParams {
         this.endpoint = endpoint;
         this.serializationFormat = serializationFormat;
         this.jsonMarshaller = jsonMarshaller;
+
+        advertisedEncodingsHeader = String.join(
+                ",", DecompressorRegistry.getDefaultInstance().getAdvertisedMessageEncodings());
     }
 
     @Override
     public <I, O> ClientCall<I, O> newCall(
             MethodDescriptor<I, O> method, CallOptions callOptions) {
-        HttpRequestWriter req = HttpRequest.streaming(
-                HttpHeaders
-                        .of(HttpMethod.POST, uri().getPath() + method.getFullMethodName())
-                        .contentType(serializationFormat.mediaType()));
-        ClientRequestContext ctx = newContext(HttpMethod.POST, req);
+        final HttpRequestWriter req = HttpRequest.streaming(
+                HttpHeaders.of(HttpMethod.POST, uri().getPath() + method.getFullMethodName())
+                           .contentType(serializationFormat.mediaType()));
+        final ClientRequestContext ctx = newContext(HttpMethod.POST, req);
         ctx.logBuilder().serializationFormat(serializationFormat);
-        ctx.logBuilder().requestContent(GrpcLogUtil.rpcRequest(method), null);
+        ctx.logBuilder().deferRequestContent();
         ctx.logBuilder().deferResponseContent();
         return new ArmeriaClientCall<>(
                 ctx,
@@ -115,7 +118,9 @@ class ArmeriaChannel extends Channel implements ClientBuilderParams {
                 CompressorRegistry.getDefaultInstance(),
                 DecompressorRegistry.getDefaultInstance(),
                 serializationFormat,
-                jsonMarshaller);
+                jsonMarshaller,
+                options().getOrElse(GrpcClientOptions.UNSAFE_WRAP_RESPONSE_BUFFERS, false),
+                advertisedEncodingsHeader);
     }
 
     @Override

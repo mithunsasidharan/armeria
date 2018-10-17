@@ -48,6 +48,7 @@ import com.linecorp.armeria.testing.internal.AnticipatedException;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.concurrent.ImmediateEventExecutor;
 
 public class StreamMessageDuplicatorTest {
@@ -271,7 +272,7 @@ public class StreamMessageDuplicatorTest {
         assertThat(queue.size()).isEqualTo(20);
     }
 
-    private void add(SignalQueue queue, int from, int to) {
+    private static void add(SignalQueue queue, int from, int to) {
         for (int i = from; i < to; i++) {
             queue.addAndRemoveIfRequested(i);
         }
@@ -309,11 +310,12 @@ public class StreamMessageDuplicatorTest {
         // duplicateStream() is not allowed anymore.
         assertThatThrownBy(duplicator::duplicateStream).isInstanceOf(IllegalStateException.class);
 
+        // Only used to read refCnt, not an actual reference.
         final ByteBuf[] bufs = new ByteBuf[30];
         for (int i = 0; i < 30; i++) {
             final ByteBuf buf = newUnpooledBuffer();
             bufs[i] = buf;
-            assertThat(publisher.write(buf)).isTrue();  // Removing internal caches happens when i = 25
+            publisher.write(buf);
             assertThat(buf.refCnt()).isOne();
         }
 
@@ -322,8 +324,30 @@ public class StreamMessageDuplicatorTest {
         }
         for (int i = 25; i < 30; i++) {  // rest of them are still in the queue.
             assertThat(bufs[i].refCnt()).isOne();
-            bufs[i].release();
         }
+        duplicator.close();
+
+        for (int i = 25; i < 30; i++) {  // rest of them are cleared after calling duplicator.close()
+            assertThat(bufs[i].refCnt()).isZero();
+        }
+    }
+
+    @Test
+    public void raiseExceptionInOnNext() {
+        final DefaultStreamMessage<ByteBuf> publisher = new DefaultStreamMessage<>();
+        final ByteBufDuplicator duplicator = new ByteBufDuplicator(publisher);
+
+        final ByteBuf buf = newUnpooledBuffer();
+        publisher.write(buf);
+        assertThat(buf.refCnt()).isOne();
+
+        // Release the buf after writing to the publisher which must not happen!
+        buf.release();
+
+        final ByteBufSubscriber subscriber = new ByteBufSubscriber();
+        duplicator.duplicateStream().subscribe(subscriber, ImmediateEventExecutor.INSTANCE);
+        assertThatThrownBy(() -> subscriber.completionFuture().get()).hasCauseInstanceOf(
+                IllegalReferenceCountException.class);
     }
 
     private static ByteBuf newUnpooledBuffer() {
@@ -368,6 +392,7 @@ public class StreamMessageDuplicatorTest {
         }
 
         @Override
+        @SuppressWarnings("UnnecessaryCallToStringValueOf")
         public void onError(Throwable t) {
             logger.debug("{}: onError({})", this, String.valueOf(t), t);
         }
@@ -378,6 +403,7 @@ public class StreamMessageDuplicatorTest {
         }
 
         @Override
+        @SuppressWarnings("UnnecessaryCallToStringValueOf")
         public void accept(Void aVoid, Throwable cause) {
             logger.debug("{}: completionFuture({})", this, String.valueOf(cause), cause);
             if (cause != null) {
@@ -410,6 +436,13 @@ public class StreamMessageDuplicatorTest {
     }
 
     private static class ByteBufSubscriber implements Subscriber<ByteBuf> {
+
+        private final CompletableFuture<Void> completionFuture = new CompletableFuture<>();
+
+        public CompletableFuture<Void> completionFuture() {
+            return completionFuture;
+        }
+
         @Override
         public void onSubscribe(Subscription subscription) {
             subscription.request(Long.MAX_VALUE);
@@ -419,9 +452,13 @@ public class StreamMessageDuplicatorTest {
         public void onNext(ByteBuf o) {}
 
         @Override
-        public void onError(Throwable throwable) {}
+        public void onError(Throwable throwable) {
+            completionFuture.completeExceptionally(throwable);
+        }
 
         @Override
-        public void onComplete() {}
+        public void onComplete() {
+            completionFuture.complete(null);
+        }
     }
 }

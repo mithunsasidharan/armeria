@@ -21,26 +21,31 @@ import static com.google.common.base.MoreObjects.firstNonNull;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
 
+import javax.annotation.Nullable;
+
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
-import com.linecorp.armeria.common.AggregatedHttpMessage;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.HttpStatusClass;
+import com.linecorp.armeria.common.stream.AbortedStreamException;
+import com.linecorp.armeria.common.stream.CancelledSubscriptionException;
 
 /**
- * A {@link Subscriber} that subscribes until it receives {@link HttpHeaders} and then returns a
- * {@link CompletableFuture} that contains {@link AggregatedHttpMessage}. The message contains
- * {@link HttpHeaders} and {@code informationalHeaders}. If this class can not subscribe the
- * {@link HttpHeaders}, it will return {@link AggregatedHttpMessage} with {@link HttpHeaders#EMPTY_HEADERS}.
+ * A {@link Subscriber} that completes the {@link CompletableFuture} which has taken as the argument in the
+ * constructor with {@link HttpHeaders}. The {@link HttpHeaders} contains a status that is not informational.
+ * If subscription is finished before subscribing a status, this will complete the future with
+ * the {@link HttpHeaders#EMPTY_HEADERS}.
  */
 public final class HttpHeaderSubscriber
         implements Subscriber<HttpObject>, BiConsumer<Void, Throwable> {
 
     private final CompletableFuture<HttpHeaders> future;
+    @Nullable
     private Subscription subscription;
+    @Nullable
     private HttpHeaders headers;
 
     /**
@@ -63,6 +68,7 @@ public final class HttpHeaderSubscriber
             final HttpStatus status = headers.status();
             if (status != null && status.codeClass() != HttpStatusClass.INFORMATIONAL && this.headers == null) {
                 this.headers = headers;
+                assert subscription != null;
                 subscription.cancel();
             }
         }
@@ -75,7 +81,12 @@ public final class HttpHeaderSubscriber
     public void onComplete() {}
 
     @Override
-    public void accept(Void aVoid, Throwable throwable) {
-        future.complete(firstNonNull(headers, HttpHeaders.EMPTY_HEADERS));
+    public void accept(Void aVoid, Throwable thrown) {
+        if (thrown != null && !(thrown instanceof CancelledSubscriptionException) &&
+            !(thrown instanceof AbortedStreamException)) {
+            future.completeExceptionally(thrown);
+        } else {
+            future.complete(firstNonNull(headers, HttpHeaders.EMPTY_HEADERS));
+        }
     }
 }

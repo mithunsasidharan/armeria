@@ -28,6 +28,7 @@ import java.util.function.Consumer;
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLSession;
 
+import com.linecorp.armeria.internal.ArmeriaHttpUtil;
 import com.linecorp.armeria.internal.DefaultAttributeMap;
 
 import io.micrometer.core.instrument.MeterRegistry;
@@ -46,12 +47,18 @@ public abstract class NonWrappingRequestContext extends AbstractRequestContext {
     private final SessionProtocol sessionProtocol;
     private final HttpMethod method;
     private final String path;
+    @Nullable
+    private String decodedPath;
+    @Nullable
     private final String query;
     private final Request request;
 
     // Callbacks
+    @Nullable
     private List<Consumer<? super RequestContext>> onEnterCallbacks;
+    @Nullable
     private List<Consumer<? super RequestContext>> onExitCallbacks;
+    @Nullable
     private List<BiConsumer<? super RequestContext, ? super RequestContext>> onChildCallbacks;
 
     /**
@@ -123,6 +130,16 @@ public abstract class NonWrappingRequestContext extends AbstractRequestContext {
     }
 
     @Override
+    public final String decodedPath() {
+        final String decodedPath = this.decodedPath;
+        if (decodedPath != null) {
+            return decodedPath;
+        }
+
+        return this.decodedPath = ArmeriaHttpUtil.decodePath(path);
+    }
+
+    @Override
     public final String query() {
         return query;
     }
@@ -190,7 +207,7 @@ public abstract class NonWrappingRequestContext extends AbstractRequestContext {
         invokeCallbacks(onExitCallbacks);
     }
 
-    private void invokeCallbacks(List<Consumer<? super RequestContext>> callbacks) {
+    private void invokeCallbacks(@Nullable List<Consumer<? super RequestContext>> callbacks) {
         if (callbacks == null) {
             return;
         }

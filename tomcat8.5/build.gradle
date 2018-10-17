@@ -1,0 +1,32 @@
+dependencyManagement {
+    // Override Tomcat versions.
+    dependencies {
+        dependencySet(group: 'org.apache.tomcat.embed', version: '8.5.34') {
+            entry 'tomcat-embed-core'
+            entry 'tomcat-embed-jasper'
+            entry 'tomcat-embed-el'
+        }
+    }
+}
+
+dependencies {
+    // Tomcat
+    [ 'tomcat-embed-core', 'tomcat-embed-jasper', 'tomcat-embed-el' ].each {
+        compile "org.apache.tomcat.embed:$it"
+    }
+
+    // Replace commons-logging (Tomcat's logging API) with SLF4J.
+    runtime 'org.slf4j:jcl-over-slf4j'
+}
+
+// Use the sources from ':tomcat' as well as ours.
+// NB: We should never add these directories using the 'sourceSets' directive because that will make
+//     them added to more than one project and having a source directory with more than one output directory
+//     will confuse IDEs such as IntelliJ IDEA.
+tasks.compileJava.source "${rootProject.projectDir}/tomcat/src/main/java"
+tasks.processResources.from "${rootProject.projectDir}/tomcat/src/main/resources"
+tasks.compileTestJava.source "${rootProject.projectDir}/tomcat/src/test/java"
+tasks.processTestResources.from "${rootProject.projectDir}/tomcat/src/test/resources"
+tasks.sourceJar.from "${rootProject.projectDir}/tomcat/src/main/java"
+tasks.sourceJar.from "${rootProject.projectDir}/tomcat/src/main/resources"
+tasks.javadoc.source "${rootProject.projectDir}/tomcat/src/main/java"

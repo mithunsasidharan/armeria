@@ -17,11 +17,12 @@ package com.linecorp.armeria.client.retry;
 
 import static java.util.Objects.requireNonNull;
 
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Function;
+import java.util.concurrent.CompletionStage;
+import java.util.function.BiFunction;
 
 import com.linecorp.armeria.client.ResponseTimeoutException;
+import com.linecorp.armeria.client.circuitbreaker.FailFastException;
 import com.linecorp.armeria.common.Flags;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
@@ -29,6 +30,7 @@ import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.HttpStatusClass;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.Response;
+import com.linecorp.armeria.common.util.Exceptions;
 
 /**
  * Determines whether a failed request should be retried.
@@ -44,17 +46,12 @@ public interface RetryStrategy<I extends Request, O extends Response> {
      * A {@link RetryStrategy} that defines a retry should not be performed.
      */
     static <I extends Request, O extends Response> RetryStrategy<I, O> never() {
-        return new RetryStrategy<I, O>() {
-            @Override
-            public CompletableFuture<Optional<Backoff>> shouldRetry(I request, O response) {
-                return CompletableFuture.completedFuture(Optional.empty());
-            }
-        };
+        return (request, response) -> CompletableFuture.completedFuture(null);
     }
 
     /**
      * Returns the {@link RetryStrategy} that retries the request with the {@link #defaultBackoff}
-     * when the response matches {@link HttpStatusClass#SERVER_ERROR}.
+     * when the response matches {@link HttpStatusClass#SERVER_ERROR} or an {@link Exception} is raised.
      */
     static RetryStrategy<HttpRequest, HttpResponse> onServerErrorStatus() {
         return onServerErrorStatus(defaultBackoff);
@@ -62,33 +59,40 @@ public interface RetryStrategy<I extends Request, O extends Response> {
 
     /**
      * Returns the {@link RetryStrategy} that retries the request with the specified {@code backoff}
-     * when the response matches {@link HttpStatusClass#SERVER_ERROR}.
+     * when the response matches {@link HttpStatusClass#SERVER_ERROR} or an {@link Exception} is raised.
      */
     static RetryStrategy<HttpRequest, HttpResponse> onServerErrorStatus(Backoff backoff) {
         requireNonNull(backoff, "backoff");
-        return onStatus(status -> status.codeClass() == HttpStatusClass.SERVER_ERROR ? Optional.of(backoff)
-                                                                                     : Optional.empty());
+        return onStatus((status, thrown) -> {
+            if ((thrown != null && !(Exceptions.peel(thrown) instanceof FailFastException)) ||
+                (status != null && status.codeClass() == HttpStatusClass.SERVER_ERROR)) {
+                return backoff;
+            }
+            return null;
+        });
     }
 
     /**
-     * Returns the {@link RetryStrategy} that decides to retry the request using
-     * {@code statusBasedBackoffFunction}.
+     * Returns the {@link RetryStrategy} that decides to retry the request using the specified
+     * {@code backoffFunction}.
      *
-     * @param statusBasedBackoffFunction the {@link Function} that returns {@code Optional<Backoff>} according
-     *                                   to the {@link HttpStatus}
+     * @param backoffFunction the {@link BiFunction} that returns the {@link Backoff} or {@code null}
+     *                        according to the {@link HttpStatus} and {@link Throwable}
      */
     static RetryStrategy<HttpRequest, HttpResponse> onStatus(
-            Function<HttpStatus, Optional<Backoff>> statusBasedBackoffFunction) {
-        return new HttpStatusBasedRetryStrategy(statusBasedBackoffFunction);
+            BiFunction<HttpStatus, Throwable, Backoff> backoffFunction) {
+        return new HttpStatusBasedRetryStrategy(backoffFunction);
     }
 
     /**
-     * Returns {@link CompletableFuture} with {@link Optional} that contains {@link Backoff} which will be
-     * used for retry. If the condition does not match, this needs to return {@link Optional#empty()}
-     * to stop retry attempt. Note that {@link ResponseTimeoutException} is not retriable for
-     * the whole retry, but each attempt.
+     * Returns a {@link CompletionStage} that contains {@link Backoff} which will be used for retry.
+     * If the condition does not match, this will return {@code null} to stop retry attempt.
+     * Note that {@link ResponseTimeoutException} is not retriable for the whole retry, but each attempt.
      *
      * @see RetryingClientBuilder#responseTimeoutMillisForEachAttempt(long)
+     *
+     * @see <a href="https://line.github.io/armeria/advanced-retry.html#per-attempt-timeout">Per-attempt
+     *      timeout</a>
      */
-    CompletableFuture<Optional<Backoff>> shouldRetry(I request, O response);
+    CompletionStage<Backoff> shouldRetry(I request, O response);
 }

@@ -16,9 +16,13 @@
 
 package com.linecorp.armeria.server.healthcheck;
 
-import java.util.Arrays;
-import java.util.Collections;
+import static java.util.Objects.requireNonNull;
+
 import java.util.List;
+
+import javax.annotation.Nullable;
+
+import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.common.AggregatedHttpMessage;
 import com.linecorp.armeria.common.HttpData;
@@ -33,6 +37,7 @@ import com.linecorp.armeria.server.ServerListener;
 import com.linecorp.armeria.server.ServerListenerAdapter;
 import com.linecorp.armeria.server.ServiceConfig;
 import com.linecorp.armeria.server.ServiceRequestContext;
+import com.linecorp.armeria.server.TransientService;
 
 /**
  * An {@link HttpService} that responds with HTTP status {@code "200 OK"} if the server is healthy and can
@@ -68,7 +73,8 @@ import com.linecorp.armeria.server.ServiceRequestContext;
  *         .build();
  * }</pre>
  */
-public class HttpHealthCheckService extends AbstractHttpService {
+public class HttpHealthCheckService extends AbstractHttpService
+        implements TransientService<HttpRequest, HttpResponse> {
 
     private static final HttpData RES_OK = HttpData.ofUtf8("ok");
     private static final HttpData RES_NOT_OK = HttpData.ofUtf8("not ok");
@@ -78,6 +84,7 @@ public class HttpHealthCheckService extends AbstractHttpService {
 
     final SettableHealthChecker serverHealth;
 
+    @Nullable
     private Server server;
 
     /**
@@ -86,7 +93,16 @@ public class HttpHealthCheckService extends AbstractHttpService {
      * @param healthCheckers the additional {@link HealthChecker}s
      */
     public HttpHealthCheckService(HealthChecker... healthCheckers) {
-        this.healthCheckers = Collections.unmodifiableList(Arrays.asList(healthCheckers));
+        this(ImmutableList.copyOf(requireNonNull(healthCheckers, "healthCheckers")));
+    }
+
+    /**
+     * Creates a new instance.
+     *
+     * @param healthCheckers the additional {@link HealthChecker}s
+     */
+    public HttpHealthCheckService(Iterable<? extends HealthChecker> healthCheckers) {
+        this.healthCheckers = ImmutableList.copyOf(requireNonNull(healthCheckers, "healthCheckers"));
         serverHealth = new SettableHealthChecker();
         serverHealthUpdater = new ServerHealthUpdater();
     }
@@ -126,7 +142,7 @@ public class HttpHealthCheckService extends AbstractHttpService {
     }
 
     @Override
-    protected HttpResponse doHead(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+    protected HttpResponse doHead(ServiceRequestContext ctx, HttpRequest req) {
         return HttpResponse.of(newResponse(ctx).headers()); // Send without the content.
     }
 
@@ -151,12 +167,12 @@ public class HttpHealthCheckService extends AbstractHttpService {
 
     final class ServerHealthUpdater extends ServerListenerAdapter {
         @Override
-        public void serverStarted(Server server) throws Exception {
+        public void serverStarted(Server server) {
             serverHealth.setHealthy(true);
         }
 
         @Override
-        public void serverStopping(Server server) throws Exception {
+        public void serverStopping(Server server) {
             serverHealth.setHealthy(false);
         }
     }

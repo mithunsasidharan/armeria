@@ -37,7 +37,6 @@ import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.message.BasicNameValuePair;
 import org.apache.http.util.EntityUtils;
-import org.junit.ClassRule;
 import org.junit.Test;
 
 import com.linecorp.armeria.client.ClientFactory;
@@ -46,7 +45,6 @@ import com.linecorp.armeria.client.HttpClient;
 import com.linecorp.armeria.common.AggregatedHttpMessage;
 import com.linecorp.armeria.server.Server;
 import com.linecorp.armeria.server.Service;
-import com.linecorp.armeria.testing.server.SelfSignedCertificateRule;
 import com.linecorp.armeria.testing.server.ServerRule;
 
 import io.netty.handler.codec.http.HttpHeaderNames;
@@ -60,16 +58,10 @@ public abstract class WebAppContainerTest {
     private static final Pattern CR_OR_LF = Pattern.compile("[\\r\\n]");
 
     /**
-     * The self-signed certificate that is used for testing a TLS connection.
-     */
-    @ClassRule
-    public static final SelfSignedCertificateRule certificate = new SelfSignedCertificateRule();
-
-    /**
      * Returns the doc-base directory of the test web application.
      */
     public static File webAppRoot() {
-        URL url = WebAppContainerTest.class.getProtectionDomain().getCodeSource().getLocation();
+        final URL url = WebAppContainerTest.class.getProtectionDomain().getCodeSource().getLocation();
         File f;
         try {
             f = new File(url.toURI());
@@ -147,11 +139,11 @@ public abstract class WebAppContainerTest {
 
     @Test
     public void https() throws Exception {
-        ClientFactory clientFactory = new ClientFactoryBuilder()
+        final ClientFactory clientFactory = new ClientFactoryBuilder()
                 .sslContextCustomizer(b -> b.trustManager(InsecureTrustManagerFactory.INSTANCE))
                 .build();
-        HttpClient client = HttpClient.of(clientFactory, server().httpsUri("/"));
-        AggregatedHttpMessage response = client.get("/jsp/index.jsp").aggregate().get();
+        final HttpClient client = HttpClient.of(clientFactory, server().httpsUri("/"));
+        final AggregatedHttpMessage response = client.get("/jsp/index.jsp").aggregate().get();
         final String actualContent = CR_OR_LF.matcher(response.content().toStringUtf8())
                                              .replaceAll("");
         assertThat(actualContent).isEqualTo(
@@ -305,7 +297,7 @@ public abstract class WebAppContainerTest {
     @Test
     public void addressesAndPorts_localhost() throws Exception {
         try (CloseableHttpClient hc = HttpClients.createMinimal()) {
-            HttpGet request = new HttpGet(server().uri("/jsp/addrs_and_ports.jsp"));
+            final HttpGet request = new HttpGet(server().uri("/jsp/addrs_and_ports.jsp"));
             request.setHeader("Host", "localhost:1111");
             try (CloseableHttpResponse res = hc.execute(request)) {
                 assertThat(res.getStatusLine().toString()).isEqualTo("HTTP/1.1 200 OK");

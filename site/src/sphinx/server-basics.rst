@@ -1,15 +1,11 @@
 .. _`a name-based virtual host`: https://en.wikipedia.org/wiki/Virtual_hosting#Name-based
-.. _LoggingService: apidocs/index.html?com/linecorp/armeria/server/logging/LoggingService.html
-.. _ServerBuilder: apidocs/index.html?com/linecorp/armeria/server/ServerBuilder.html
-.. _VirtualHost: apidocs/index.html?com/linecorp/armeria/server/VirtualHost.html
-.. _VirtualHostBuilder: apidocs/index.html?com/linecorp/armeria/server/VirtualHostBuilder.html
 
 .. _server-basics:
 
 Server basics
 =============
 
-To start a server, you need to build it first. Use `ServerBuilder`_:
+To start a server, you need to build it first. Use :api:`ServerBuilder`:
 
 .. code-block:: java
 
@@ -19,7 +15,9 @@ To start a server, you need to build it first. Use `ServerBuilder`_:
     ServerBuilder sb = new ServerBuilder();
     // TODO: Configure your server here.
     Server server = sb.build();
-    server.start();
+    CompletableFuture<Void> future = server.start();
+    // Wait until the server is ready.
+    future.join();
 
 Ports
 -----
@@ -28,11 +26,9 @@ To serve anything, you need to specify which TCP/IP port you want to bind onto:
 
 .. code-block:: java
 
-    import static com.linecorp.armeria.common.SessionProtocol.HTTP;
-
     ServerBuilder sb = new ServerBuilder();
     // Configure an HTTP port.
-    sb.port(8080, HTTP);
+    sb.http(8080);
     // TODO: Add your services here.
     Server server = sb.build();
     CompletableFuture<Void> future = server.start();
@@ -45,60 +41,59 @@ Even if we opened a port, it's of no use if we didn't bind any services to them.
 
 .. code-block:: java
 
+    import com.linecorp.armeria.common.HttpParameters;
     import com.linecorp.armeria.common.HttpRequest;
-    import com.linecorp.armeria.common.HttpResponseWriter;
+    import com.linecorp.armeria.common.HttpResponse;
     import com.linecorp.armeria.common.HttpStatus;
     import com.linecorp.armeria.common.MediaType;
 
-    import com.linecorp.armeria.server.ServiceRequestContext;
     import com.linecorp.armeria.server.AbstractHttpService;
+    import com.linecorp.armeria.server.Server;
+    import com.linecorp.armeria.server.ServerBuilder;
+    import com.linecorp.armeria.server.ServiceRequestContext;
+    import com.linecorp.armeria.server.annotation.Consumes;
+    import com.linecorp.armeria.server.annotation.Default;
+    import com.linecorp.armeria.server.annotation.Get;
+    import com.linecorp.armeria.server.annotation.Param;
+    import com.linecorp.armeria.server.annotation.Post;
+    import com.linecorp.armeria.server.annotation.Produces;
+    import com.linecorp.armeria.server.logging.LoggingService;
 
     ServerBuilder sb = new ServerBuilder();
-    sb.port(8080, HTTP);
+    sb.http(8080);
 
     // Add a simple 'Hello, world!' service.
-    sb.service("/", new AbstractHttpService() {
-        @Override
-        protected void doGet(ServiceRequestContext ctx,
-                             HttpRequest req, HttpResponseWriter res) {
-            res.respond(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "Hello, world!");
-        }
-    });
+    sb.service("/", (ctx, res) -> HttpResponse.of("Hello, world!"));
 
     // Using path variables:
     sb.service("/greet/{name}", new AbstractHttpService() {
         @Override
-        protected void doGet(ServiceRequestContext ctx,
-                             HttpRequest req, HttpResponseWriter res) {
+        protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) throws Exception {
             String name = ctx.pathParam("name");
-            res.respond(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "Hello, %s!", name);
+            return HttpResponse.of("Hello, %s!", name);
         }
-    }.decorate(LoggingService.newDecorator()); // Enable logging
+    }.decorate(LoggingService.newDecorator())); // Enable logging
 
     // Using an annotated service object:
     sb.annotatedService(new Object() {
-        @Get("/greet2/{name}")
+        @Get("/greet2/:name") // `:name` style is also available
         public HttpResponse greet(@Param("name") String name) {
-            return HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "Hello, %s!", name);
+            return HttpResponse.of("Hello, %s!", name);
         }
     });
 
     // Just in case your name contains a slash:
-    sb.serviceUnder("/greet3", new AbstractHttpService() {
-        @Override
-        protected void doGet(ServiceRequestContext ctx,
-                             HttpRequest req, HttpResponseWriter res) {
-            String path = ctx.pathWithoutPrefix();  // Get the path without the prefix ('/hello')
-            String name = path.substring(1); // Strip the leading slash ('/')
-            res.respond(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "Hello, %s!", name);
-        }
+    sb.serviceUnder("/greet3", (ctx, req) -> {
+        String path = ctx.mappedPath();  // Get the path without the prefix ('/greet3')
+        String name = path.substring(1); // Strip the leading slash ('/')
+        return HttpResponse.of("Hello, %s!", name);
     });
 
     // Using an annotated service object:
     sb.annotatedService(new Object() {
         @Get("regex:^/greet4/(?<name>.*)$")
         public HttpResponse greet(@Param("name") String name) {
-            return HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "Hello, %s!", name);
+            return HttpResponse.of("Hello, %s!", name);
         }
     });
 
@@ -106,9 +101,9 @@ Even if we opened a port, it's of no use if we didn't bind any services to them.
     sb.annotatedService(new Object() {
         @Get("/greet5")
         public HttpResponse greet(@Param("name") String name,
-                                  @Param("title") @Optional("Mr.") String title) {
+                                  @Param("title") @Default("Mr.") String title) {
             // "Mr." is used by default if there is no title parameter in the request.
-            return HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "Hello, %s %s!", title, name);
+            return HttpResponse.of("Hello, %s %s!", title, name);
         }
     });
 
@@ -116,20 +111,20 @@ Even if we opened a port, it's of no use if we didn't bind any services to them.
     sb.annotatedService(new Object() {
         @Get("/greet6")
         public HttpResponse greet(HttpParameters parameters) {
-            return HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "Hello, %s!",
-                                   parameters.get("name");
+            return HttpResponse.of("Hello, %s!", parameters.get("name"));
+        }
     });
 
     // Using media type negotiation:
     sb.annotatedService(new Object() {
         @Get("/greet7")
-        @ProduceType("application/json;charset=UTF-8")
+        @Produces("application/json;charset=UTF-8")
         public HttpResponse greetGet(@Param("name") String name) {
             return HttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8, "{\"name\":\"%s\"}", name);
         }
 
         @Post("/greet7")
-        @ConsumeType("application/x-www-form-urlencoded")
+        @Consumes("application/x-www-form-urlencoded")
         public HttpResponse greetPost(@Param("name") String name) {
             return HttpResponse.of(HttpStatus.OK);
         }
@@ -140,11 +135,11 @@ Even if we opened a port, it's of no use if we didn't bind any services to them.
     future.join();
 
 As described in the example, ``service()`` and ``serviceUnder()`` perform an exact match and a prefix match
-on a request path respectively. `ServerBuilder`_ also provides advanced path mapping such as regex and glob
-pattern matching.
+on a request path respectively. :api:`ServerBuilder` also provides advanced path mapping such as regex and
+glob pattern matching.
 
-Also, we decorated the second service using LoggingService_, which logs all requests and responses. You might
-be interested in decorating a service using other decorators, for example to gather metrics.
+Also, we decorated the second service using :api:`LoggingService`, which logs all requests and responses.
+You might be interested in decorating a service using other decorators, for example to gather metrics.
 
 You can also use an arbitrary object that's annotated by the ``@Path`` annotation using ``annotatedService()``.
 
@@ -156,12 +151,45 @@ You can also add an HTTPS port with your certificate and its private key files:
 
 .. code-block:: java
 
+    ServerBuilder sb = new ServerBuilder();
+    sb.https(8443)
+      .tls(new File("certificate.crt"), new File("private.key"), "myPassphrase");
+    ...
+
+
+PROXY protocol
+--------------
+
+Armeria supports both text (v1) and binary (v2) versions of `PROXY protocol <https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt>`_.
+If your server is behind a load balancer such as `HAProxy <https://www.haproxy.org/>`_ and
+`AWS ELB <https://aws.amazon.com/elasticloadbalancing/>`_, you could consider enabling the PROXY protocol:
+
+.. code-block:: java
+
+    import static com.linecorp.armeria.common.SessionProtocol.HTTP;
     import static com.linecorp.armeria.common.SessionProtocol.HTTPS;
+    import static com.linecorp.armeria.common.SessionProtocol.PROXY;
 
     ServerBuilder sb = new ServerBuilder();
-    sb.port(8443, HTTPS)
-      .sslContext(HTTPS, new File("certificate.crt"), new File("private.key"), "myPassphrase");
+    sb.port(8080, PROXY, HTTP);
+    sb.port(8443, PROXY, HTTPS);
     ...
+
+
+Serving HTTP and HTTPS on the same port
+---------------------------------------
+
+For whatever reason, you may have to serve both HTTP and HTTPS on the same port. Armeria is one of the few
+implementations that supports port unification:
+
+.. code-block:: java
+
+    ServerBuilder sb = new ServerBuilder();
+    sb.port(8888, HTTP, HTTPS);
+    // Enable PROXY protocol, too.
+    sb.port(9999, PROXY, HTTP, HTTPS);
+    ...
+
 
 Virtual hosts
 -------------
@@ -177,14 +205,14 @@ Use ``ServerBuilder.withVirtualHost()`` to configure `a name-based virtual host`
     // Configure foo.com.
     sb.withVirtualHost("foo.com")
       .service(...)
-      .sslContext(...)
+      .tls(...)
       .and() // Configure *.bar.com.
       .withVirtualHost("*.bar.com")
       .service(...)
-      .sslContext(...)
+      .tls(...)
       .and() // Configure the default virtual host.
       .service(...)
-      .sslContext(...);
+      .tls(...);
     ...
 
 See also

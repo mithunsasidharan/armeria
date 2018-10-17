@@ -16,13 +16,15 @@
 
 package com.linecorp.armeria.server.cors;
 
+import java.time.Instant;
 import java.util.Collections;
-import java.util.Date;
 import java.util.EnumSet;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.function.Supplier;
+
+import javax.annotation.Nullable;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableMap;
@@ -50,15 +52,20 @@ public final class CorsConfig {
     public static final CorsConfig DISABLED = new CorsConfig();
 
     private final boolean enabled;
+    @Nullable
     private final Set<String> origins;
     private final boolean anyOriginSupported;
     private final boolean nullOriginAllowed;
     private final boolean credentialsAllowed;
     private final boolean shortCircuit;
     private final long maxAge;
+    @Nullable
     private final Set<AsciiString> exposedHeaders;
+    @Nullable
     private final Set<HttpMethod> allowedRequestMethods;
+    @Nullable
     private final Set<AsciiString> allowedRequestHeaders;
+    @Nullable
     private final Map<AsciiString, Supplier<?>> preflightResponseHeaders;
 
     CorsConfig() {
@@ -95,8 +102,9 @@ public final class CorsConfig {
         if (builder.preflightResponseHeadersDisabled) {
             preflightResponseHeaders = Collections.emptyMap();
         } else if (builder.preflightResponseHeaders.isEmpty()) {
-            preflightResponseHeaders = ImmutableMap.of(HttpHeaderNames.DATE, DateValueSupplier.INSTANCE,
-                                               HttpHeaderNames.CONTENT_LENGTH, ConstantValueSupplier.ZERO);
+            preflightResponseHeaders = ImmutableMap.of(
+                    HttpHeaderNames.DATE, InstantValueSupplier.INSTANCE,
+                    HttpHeaderNames.CONTENT_LENGTH, ConstantValueSupplier.ZERO);
         } else {
             preflightResponseHeaders = ImmutableMap.copyOf(builder.preflightResponseHeaders);
         }
@@ -325,11 +333,12 @@ public final class CorsConfig {
                         preflightResponseHeaders);
     }
 
-    static String toString(Object obj, boolean enabled, Set<String> origins, boolean anyOriginSupported,
-                           boolean nullOriginAllowed, boolean credentialsAllowed, boolean shortCircuit,
-                           long maxAge, Set<AsciiString> exposedHeaders, Set<HttpMethod> allowedRequestMethods,
-                           Set<AsciiString> allowedRequestHeaders,
-                           Map<AsciiString, Supplier<?>> preflightResponseHeaders) {
+    static String toString(Object obj, boolean enabled, @Nullable Set<String> origins,
+                           boolean anyOriginSupported, boolean nullOriginAllowed, boolean credentialsAllowed,
+                           boolean shortCircuit, long maxAge, @Nullable Set<AsciiString> exposedHeaders,
+                           @Nullable Set<HttpMethod> allowedRequestMethods,
+                           @Nullable Set<AsciiString> allowedRequestHeaders,
+                           @Nullable Map<AsciiString, Supplier<?>> preflightResponseHeaders) {
         if (enabled) {
             return MoreObjects.toStringHelper(obj)
                               .add("origins", origins)
@@ -378,18 +387,18 @@ public final class CorsConfig {
      * It's value must be generated when the response is generated, hence will be
      * different for every call.
      */
-    static final class DateValueSupplier implements Supplier<Date> {
+    static final class InstantValueSupplier implements Supplier<Instant> {
 
-        static final DateValueSupplier INSTANCE = new DateValueSupplier();
+        static final InstantValueSupplier INSTANCE = new InstantValueSupplier();
 
         @Override
-        public Date get() {
-            return new Date();
+        public Instant get() {
+            return Instant.now();
         }
 
         @Override
         public String toString() {
-            return "<date>";
+            return "<now>";
         }
     }
 }

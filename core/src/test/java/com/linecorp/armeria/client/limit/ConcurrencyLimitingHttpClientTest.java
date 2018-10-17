@@ -27,7 +27,7 @@ import static org.mockito.Mockito.when;
 
 import java.util.concurrent.TimeUnit;
 
-import org.junit.AfterClass;
+import org.junit.ClassRule;
 import org.junit.Test;
 
 import com.linecorp.armeria.client.Client;
@@ -37,18 +37,12 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.stream.NoopSubscriber;
-
-import io.netty.channel.DefaultEventLoop;
-import io.netty.channel.EventLoop;
+import com.linecorp.armeria.testing.common.EventLoopRule;
 
 public class ConcurrencyLimitingHttpClientTest {
 
-    private static final EventLoop eventLoop = new DefaultEventLoop();
-
-    @AfterClass
-    public static void destroy() {
-        eventLoop.shutdownGracefully();
-    }
+    @ClassRule
+    public static final EventLoopRule eventLoop = new EventLoopRule();
 
     /**
      * Tests the request pattern  that does not exceed maxConcurrency.
@@ -173,8 +167,7 @@ public class ConcurrencyLimitingHttpClientTest {
         final Client<HttpRequest, HttpResponse> delegate = mock(Client.class);
         when(delegate.execute(ctx, req)).thenThrow(Exception.class);
 
-        final ConcurrencyLimitingHttpClient client =
-                ConcurrencyLimitingHttpClient.newDecorator(1).apply(delegate);
+        final ConcurrencyLimitingHttpClient client = newDecorator(1).apply(delegate);
         assertThat(client.numActiveRequests()).isZero();
 
         final HttpResponse res = client.execute(ctx, req);
@@ -220,8 +213,7 @@ public class ConcurrencyLimitingHttpClientTest {
         final Client<HttpRequest, HttpResponse> delegate = mock(Client.class);
         when(delegate.execute(ctx, req)).thenThrow(Exception.class);
 
-        final ConcurrencyLimitingHttpClient client =
-                ConcurrencyLimitingHttpClient.newDecorator(0).apply(delegate);
+        final ConcurrencyLimitingHttpClient client = newDecorator(0).apply(delegate);
 
         // A request should be delegated immediately, rethrowing the exception from the delegate.
         assertThatThrownBy(() -> client.execute(ctx, req)).isInstanceOf(Exception.class);
@@ -233,7 +225,7 @@ public class ConcurrencyLimitingHttpClientTest {
 
     private static ClientRequestContext newContext() {
         final ClientRequestContext ctx = mock(ClientRequestContext.class);
-        when(ctx.eventLoop()).thenReturn(eventLoop);
+        when(ctx.eventLoop()).thenReturn(eventLoop.get());
         return ctx;
     }
 
@@ -249,6 +241,6 @@ public class ConcurrencyLimitingHttpClientTest {
     }
 
     private static void waitForEventLoop() {
-        eventLoop.submit(() -> { /* no-op */ }).syncUninterruptibly();
+        eventLoop.get().submit(() -> { /* no-op */ }).syncUninterruptibly();
     }
 }

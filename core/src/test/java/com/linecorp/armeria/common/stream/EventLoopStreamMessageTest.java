@@ -22,6 +22,6 @@ public class EventLoopStreamMessageTest extends AbstractStreamMessageAndWriterTe
 
     @Override
     <T> StreamMessageAndWriter<T> newStreamWriter(List<T> unused) {
-        return new EventLoopStreamMessage<>(eventLoop());
+        return new EventLoopStreamMessage<>(eventLoop.get());
     }
 }

@@ -16,11 +16,11 @@
 
 package com.linecorp.armeria.internal.metric;
 
-import static com.linecorp.armeria.common.metric.MoreMeters.summaryWithDefaultQuantiles;
-import static com.linecorp.armeria.common.metric.MoreMeters.timerWithDefaultQuantiles;
+import static com.linecorp.armeria.common.metric.MoreMeters.newDistributionSummary;
+import static com.linecorp.armeria.common.metric.MoreMeters.newTimer;
 
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 
 import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.RpcResponse;
@@ -40,56 +40,52 @@ import io.netty.util.AttributeKey;
  */
 public final class RequestMetricSupport {
 
-    private static final AttributeKey<RequestMetrics> ATTR_REQUEST_METRICS =
-            AttributeKey.valueOf(RequestMetricSupport.class, "REQUEST_METRICS");
-
-    private static final RequestMetrics PLACEHOLDER = new RequestMetricsPlaceholder();
+    // A variable to make sure setup method is not called twice.
+    private static final AttributeKey<Boolean> ATTR_REQUEST_METRICS_SET =
+            AttributeKey.valueOf(Boolean.class, "REQUEST_METRICS_SET");
 
     public static void setup(RequestContext ctx, MeterIdPrefixFunction meterIdPrefixFunction) {
-        if (ctx.hasAttr(ATTR_REQUEST_METRICS)) {
+        if (ctx.hasAttr(ATTR_REQUEST_METRICS_SET)) {
             return;
         }
+        ctx.attr(ATTR_REQUEST_METRICS_SET).set(true);
 
-        // Set the attribute to the placeholder so that calling this method again has no effect.
-        // The attribute will be set to the real one later in onRequestStart()
-        ctx.attr(ATTR_REQUEST_METRICS).set(PLACEHOLDER);
-
-        ctx.log().addListener(log -> onRequestStart(log, meterIdPrefixFunction),
+        ctx.log().addListener(log -> onRequest(log, meterIdPrefixFunction),
                               RequestLogAvailability.REQUEST_HEADERS,
                               RequestLogAvailability.REQUEST_CONTENT);
-        ctx.log().addListener(RequestMetricSupport::onRequestEnd,
-                              RequestLogAvailability.REQUEST_END);
-        ctx.log().addListener(RequestMetricSupport::onResponse,
+    }
+
+    private static void onRequest(RequestLog log, MeterIdPrefixFunction meterIdPrefixFunction) {
+        final RequestContext ctx = log.context();
+        final MeterRegistry registry = ctx.meterRegistry();
+        final MeterIdPrefix activeRequestsId = meterIdPrefixFunction.activeRequestPrefix(registry, log)
+                                                                    .append("activeRequests");
+
+        final ActiveRequestMetrics activeRequestMetrics = MicrometerUtil.register(
+                registry, activeRequestsId, ActiveRequestMetrics.class,
+                (reg, prefix) ->
+                        reg.gauge(prefix.name(), prefix.tags(),
+                                  new ActiveRequestMetrics(), ActiveRequestMetrics::doubleValue));
+        activeRequestMetrics.increment();
+        ctx.log().addListener(requestLog -> onResponse(requestLog, meterIdPrefixFunction, activeRequestMetrics),
                               RequestLogAvailability.COMPLETE);
     }
 
-    private static void onRequestStart(RequestLog log, MeterIdPrefixFunction meterIdPrefixFunction) {
+    private static void onResponse(RequestLog log, MeterIdPrefixFunction meterIdPrefixFunction,
+                                   ActiveRequestMetrics activeRequestMetrics) {
         final RequestContext ctx = log.context();
         final MeterRegistry registry = ctx.meterRegistry();
         final MeterIdPrefix idPrefix = meterIdPrefixFunction.apply(registry, log);
-        final RequestMetrics requestMetrics =  MicrometerUtil.register(
+        final RequestMetrics metrics = MicrometerUtil.register(
                 registry, idPrefix, RequestMetrics.class, DefaultRequestMetrics::new);
 
-        ctx.attr(ATTR_REQUEST_METRICS).set(requestMetrics);
-        requestMetrics.active().incrementAndGet();
-    }
-
-    private static void onRequestEnd(RequestLog log) {
-        final RequestMetrics metrics = requestMetrics(log);
-        metrics.requestDuration().record(log.requestDurationNanos(), TimeUnit.NANOSECONDS);
-        metrics.requestLength().record(log.requestLength());
         if (log.requestCause() != null) {
             metrics.failure().increment();
-            metrics.active().decrementAndGet();
-        }
-    }
-
-    private static void onResponse(RequestLog log) {
-        if (log.requestCause() != null) {
             return;
         }
 
-        final RequestMetrics metrics = requestMetrics(log);
+        metrics.requestDuration().record(log.requestDurationNanos(), TimeUnit.NANOSECONDS);
+        metrics.requestLength().record(log.requestLength());
         metrics.responseDuration().record(log.responseDurationNanos(), TimeUnit.NANOSECONDS);
         metrics.responseLength().record(log.responseLength());
         metrics.totalDuration().record(log.totalDurationNanos(), TimeUnit.NANOSECONDS);
@@ -100,7 +96,7 @@ public final class RequestMetricSupport {
             metrics.failure().increment();
         }
 
-        metrics.active().decrementAndGet();
+        activeRequestMetrics.decrement();
     }
 
     private static boolean isSuccess(RequestLog log) {
@@ -121,15 +117,10 @@ public final class RequestMetricSupport {
         return true;
     }
 
-    private static RequestMetrics requestMetrics(RequestLog log) {
-        return log.context().attr(ATTR_REQUEST_METRICS).get();
-    }
-
     private RequestMetricSupport() {}
 
+    // metrics that only needed to be called when a request completed
     private interface RequestMetrics {
-        AtomicInteger active();
-
         Counter success();
 
         Counter failure();
@@ -145,9 +136,10 @@ public final class RequestMetricSupport {
         Timer totalDuration();
     }
 
+    private static final class ActiveRequestMetrics extends LongAdder {}
+
     private static final class DefaultRequestMetrics implements RequestMetrics {
 
-        private final AtomicInteger active;
         private final Counter success;
         private final Counter failure;
         private final Timer requestDuration;
@@ -157,27 +149,20 @@ public final class RequestMetricSupport {
         private final Timer totalDuration;
 
         DefaultRequestMetrics(MeterRegistry parent, MeterIdPrefix idPrefix) {
-            active = parent.gauge(idPrefix.name("activeRequests"), idPrefix.tags(),
-                                  new AtomicInteger(), AtomicInteger::get);
             final String requests = idPrefix.name("requests");
             success = parent.counter(requests, idPrefix.tags("result", "success"));
             failure = parent.counter(requests, idPrefix.tags("result", "failure"));
 
-            requestDuration = timerWithDefaultQuantiles(
+            requestDuration = newTimer(
                     parent, idPrefix.name("requestDuration"), idPrefix.tags());
-            requestLength = summaryWithDefaultQuantiles(
+            requestLength = newDistributionSummary(
                     parent, idPrefix.name("requestLength"), idPrefix.tags());
-            responseDuration = timerWithDefaultQuantiles(
+            responseDuration = newTimer(
                     parent, idPrefix.name("responseDuration"), idPrefix.tags());
-            responseLength = summaryWithDefaultQuantiles(
+            responseLength = newDistributionSummary(
                     parent, idPrefix.name("responseLength"), idPrefix.tags());
-            totalDuration = timerWithDefaultQuantiles(
+            totalDuration = newTimer(
                     parent, idPrefix.name("totalDuration"), idPrefix.tags());
-        }
-
-        @Override
-        public AtomicInteger active() {
-            return active;
         }
 
         @Override
@@ -213,48 +198,6 @@ public final class RequestMetricSupport {
         @Override
         public Timer totalDuration() {
             return totalDuration;
-        }
-    }
-
-    private static final class RequestMetricsPlaceholder implements RequestMetrics {
-        @Override
-        public AtomicInteger active() {
-            throw new IllegalStateException();
-        }
-
-        @Override
-        public Counter success() {
-            throw new IllegalStateException();
-        }
-
-        @Override
-        public Counter failure() {
-            throw new IllegalStateException();
-        }
-
-        @Override
-        public Timer requestDuration() {
-            throw new IllegalStateException();
-        }
-
-        @Override
-        public DistributionSummary requestLength() {
-            throw new IllegalStateException();
-        }
-
-        @Override
-        public Timer responseDuration() {
-            throw new IllegalStateException();
-        }
-
-        @Override
-        public DistributionSummary responseLength() {
-            throw new IllegalStateException();
-        }
-
-        @Override
-        public Timer totalDuration() {
-            throw new IllegalStateException();
         }
     }
 }

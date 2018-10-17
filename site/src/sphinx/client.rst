@@ -12,3 +12,6 @@ Writing a client
     client-grpc
     client-decorator
     client-custom-http-headers
+    client-retry
+    client-circuit-breaker
+    client-service-discovery

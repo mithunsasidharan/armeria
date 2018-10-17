@@ -19,29 +19,40 @@ import static com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy.ROU
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
+import java.time.Duration;
+import java.time.temporal.ChronoUnit;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import javax.annotation.Nullable;
+
 import org.junit.Before;
 import org.junit.ClassRule;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.client.endpoint.EndpointGroupRegistry;
 import com.linecorp.armeria.client.endpoint.StaticEndpointGroup;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.internal.PathAndQuery;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.ServerBuilder;
@@ -66,15 +77,17 @@ import retrofit2.http.Path;
 import retrofit2.http.Query;
 import retrofit2.http.Url;
 
+@RunWith(Parameterized.class)
 public class ArmeriaCallFactoryTest {
     public static class Pojo {
+        @Nullable
         @JsonProperty("name")
         String name;
         @JsonProperty("age")
         int age;
 
         @JsonCreator
-        public Pojo(@JsonProperty("name") String name, @JsonProperty("age") int age) {
+        public Pojo(@JsonProperty("name") @Nullable String name, @JsonProperty("age") int age) {
             this.name = name;
             this.age = age;
         }
@@ -87,8 +100,8 @@ public class ArmeriaCallFactoryTest {
             if (!(o instanceof Pojo)) {
                 return false;
             }
-            Pojo other = (Pojo) o;
-            return name.equals(other.name) && age == other.age;
+            final Pojo other = (Pojo) o;
+            return Objects.equals(name, other.name) && age == other.age;
         }
 
         @Override
@@ -138,7 +151,8 @@ public class ArmeriaCallFactoryTest {
                                                           @Field("age") int age);
 
         @POST("/postCustomContentType")
-        CompletableFuture<Response<Void>> postCustomContentType(@Header("Content-Type") String contentType);
+        CompletableFuture<Response<Void>> postCustomContentType(
+                @Header("Content-Type") @Nullable String contentType);
 
         @GET
         CompletableFuture<Pojo> fullUrl(@Url String url);
@@ -151,6 +165,10 @@ public class ArmeriaCallFactoryTest {
 
         @GET("{path}")
         CompletableFuture<Pojo> customPathEncoded(@Path(value = "path", encoded = true) String path);
+
+        @GET("/headers")
+        CompletableFuture<Pojo> customHeaders(
+                @Header("x-header1") String header1, @Header("x-header2") String header2);
     }
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -163,117 +181,136 @@ public class ArmeriaCallFactoryTest {
                 @Override
                 protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) throws Exception {
                     return HttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
-                                "{\"name\":\"Cony\", \"age\":26}");
+                                           "{\"name\":\"Cony\", \"age\":26}");
                 }
             })
               .serviceUnder("/pathWithName", new AbstractHttpService() {
 
                   @Override
                   protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-                      return HttpResponse.from(req.aggregate().handle(((aReq, cause) -> {
-                          Map<String, List<String>> params = new QueryStringDecoder(aReq.path())
+                      return HttpResponse.from(req.aggregate().handle((aReq, cause) -> {
+                          final Map<String, List<String>> params = new QueryStringDecoder(aReq.path())
                                   .parameters();
-                          String fullPath = PathAndQuery.parse(req.path()).path();
+                          final String fullPath = PathAndQuery.parse(req.path()).path();
                           return HttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
-                                      "{\"name\":\"" + fullPath.replace("/pathWithName/", "") + "\", " +
-                                      "\"age\":" + params.get("age").get(0) + '}');
-                      })));
+                                                 "{\"name\":\"" + fullPath.replace("/pathWithName/", "") +
+                                                 "\", \"age\":" + params.get("age").get(0) + '}');
+                      }));
                   }
               })
               .service("/nest/pojo", new AbstractHttpService() {
                   @Override
                   protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) throws Exception {
                       return HttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
-                                  "{\"name\":\"Leonard\", \"age\":21}");
+                                             "{\"name\":\"Leonard\", \"age\":21}");
                   }
               })
               .service("/pojos", new AbstractHttpService() {
                   @Override
                   protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) throws Exception {
                       return HttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
-                                  "[{\"name\":\"Cony\", \"age\":26}," +
-                                  "{\"name\":\"Leonard\", \"age\":21}]");
+                                             "[{\"name\":\"Cony\", \"age\":26}," +
+                                             "{\"name\":\"Leonard\", \"age\":21}]");
                   }
               })
               .service("/queryString", new AbstractHttpService() {
                   @Override
                   protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-                      return HttpResponse.from(req.aggregate().handle(((aReq, cause) -> {
-                          Map<String, List<String>> params = new QueryStringDecoder(aReq.path())
+                      return HttpResponse.from(req.aggregate().handle((aReq, cause) -> {
+                          final Map<String, List<String>> params = new QueryStringDecoder(aReq.path())
                                   .parameters();
                           return HttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
-                                      "{\"name\":\"" + params.get("name").get(0) + "\", " +
-                                      "\"age\":" + params.get("age").get(0) + '}');
-                      })));
+                                                 "{\"name\":\"" + params.get("name").get(0) + "\", " +
+                                                 "\"age\":" + params.get("age").get(0) + '}');
+                      }));
                   }
               })
               .service("/post", new AbstractHttpService() {
                   @Override
                   protected HttpResponse doPost(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-                      return HttpResponse.from(req.aggregate().handle(((aReq, cause) -> {
+                      return HttpResponse.from(req.aggregate().handle((aReq, cause) -> {
                           if (cause != null) {
                               return HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR,
-                                          MediaType.PLAIN_TEXT_UTF_8,
-                                          Throwables.getStackTraceAsString(cause));
+                                                     MediaType.PLAIN_TEXT_UTF_8,
+                                                     Exceptions.traceText(cause));
                           }
-                          String text = aReq.content().toStringUtf8();
+                          final String text = aReq.content().toStringUtf8();
                           final Pojo request;
                           try {
                               request = OBJECT_MAPPER.readValue(text, Pojo.class);
                           } catch (IOException e) {
                               return HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR,
-                                          MediaType.PLAIN_TEXT_UTF_8,
-                                          Throwables.getStackTraceAsString(e));
+                                                     MediaType.PLAIN_TEXT_UTF_8,
+                                                     Exceptions.traceText(e));
                           }
                           assertThat(request).isEqualTo(new Pojo("Cony", 26));
                           return HttpResponse.of(HttpStatus.OK);
-                      })));
+                      }));
                   }
               })
               .service("/postForm", new AbstractHttpService() {
                   @Override
                   protected HttpResponse doPost(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-                      return HttpResponse.from(req.aggregate().handle(((aReq, cause) -> {
+                      return HttpResponse.from(req.aggregate().handle((aReq, cause) -> {
                           if (cause != null) {
                               return HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR,
-                                          MediaType.PLAIN_TEXT_UTF_8,
-                                          Throwables.getStackTraceAsString(cause));
+                                                     MediaType.PLAIN_TEXT_UTF_8,
+                                                     Exceptions.traceText(cause));
                           }
-                          Map<String, List<String>> params = new QueryStringDecoder(
+                          final Map<String, List<String>> params = new QueryStringDecoder(
                                   aReq.content().toStringUtf8(), false)
                                   .parameters();
                           return HttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
-                                      "{\"name\":\"" + params.get("name").get(0) + "\", " +
-                                      "\"age\":" + params.get("age").get(0) + '}');
-                      })));
+                                                 "{\"name\":\"" + params.get("name").get(0) + "\", " +
+                                                 "\"age\":" + params.get("age").get(0) + '}');
+                      }));
                   }
               })
               .service("/postCustomContentType", new AbstractHttpService() {
                   @Override
                   protected HttpResponse doPost(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-                      return HttpResponse.from(req.aggregate().handle(((aReq, cause) -> {
+                      return HttpResponse.from(req.aggregate().handle((aReq, cause) -> {
                           if (cause != null) {
                               return HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR,
-                                          MediaType.PLAIN_TEXT_UTF_8,
-                                          Throwables.getStackTraceAsString(cause));
+                                                     MediaType.PLAIN_TEXT_UTF_8,
+                                                     Exceptions.traceText(cause));
                           }
-                          Map<String, List<String>> params = new QueryStringDecoder(
-                                  aReq.content().toStringUtf8(), false)
-                                  .parameters();
-                          assertThat(params).isEmpty();
+                          assertThat(req.headers().contentType()).isNull();
                           return HttpResponse.of(HttpStatus.OK);
-                      })));
+                      }));
+                  }
+              })
+              .service("/headers", new AbstractHttpService() {
+                  @Override
+                  protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+                      assertThat(req.headers().get(HttpHeaderNames.of("x-header1"))).isEqualTo("foo");
+                      assertThat(req.headers().get(HttpHeaderNames.of("x-header2"))).isEqualTo("bar");
+                      return HttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
+                                             "{\"name\":\"Cony\", \"age\":26}");
                   }
               });
+            sb.defaultRequestTimeout(Duration.of(30, ChronoUnit.SECONDS));
         }
     };
 
+    @Parameters(name = "{index}: streaming={0}")
+    public static Collection<Boolean> parameters() {
+        return ImmutableList.of(true, false);
+    }
+
+    private final boolean streaming;
+
     private Service service;
+
+    public ArmeriaCallFactoryTest(boolean streaming) {
+        this.streaming = streaming;
+    }
 
     @Before
     public void setUp() {
         service = new ArmeriaRetrofitBuilder()
                 .baseUrl(server.uri("/"))
+                .streaming(streaming)
                 .addConverterFactory(JacksonConverterFactory.create(OBJECT_MAPPER))
                 .addCallAdapterFactory(Java8CallAdapterFactory.create())
                 .build()
@@ -282,26 +319,26 @@ public class ArmeriaCallFactoryTest {
 
     @Test
     public void pojo() throws Exception {
-        Pojo pojo = service.pojo().get();
+        final Pojo pojo = service.pojo().get();
         assertThat(pojo).isEqualTo(new Pojo("Cony", 26));
     }
 
     @Test
     public void pojoNotRoot() throws Exception {
-        Pojo pojo = service.pojoNotRoot().get();
+        final Pojo pojo = service.pojoNotRoot().get();
         assertThat(pojo).isEqualTo(new Pojo("Cony", 26));
     }
 
     @Test
     public void pojos() throws Exception {
-        List<Pojo> pojos = service.pojos().get();
+        final List<Pojo> pojos = service.pojos().get();
         assertThat(pojos.get(0)).isEqualTo(new Pojo("Cony", 26));
         assertThat(pojos.get(1)).isEqualTo(new Pojo("Leonard", 21));
     }
 
     @Test
     public void queryString() throws Exception {
-        Pojo response = service.queryString("Cony", 26).get();
+        final Pojo response = service.queryString("Cony", 26).get();
         assertThat(response).isEqualTo(new Pojo("Cony", 26));
     }
 
@@ -310,8 +347,17 @@ public class ArmeriaCallFactoryTest {
         Pojo response = service.queryString("Foo+Bar", 33).get();
         assertThat(response).isEqualTo(new Pojo("Foo+Bar", 33));
 
+        response = service.queryString("Foo&name=Bar", 34).get();
+        assertThat(response).isEqualTo(new Pojo("Foo&name=Bar", 34));
+
+        response = service.queryString("Foo;Bar", 33).get();
+        assertThat(response).isEqualTo(new Pojo("Foo;Bar", 33));
+
         response = service.queryString("Foo%2BBar", 33).get();
         assertThat(response).isEqualTo(new Pojo("Foo%2BBar", 33));
+
+        response = service.queryString("Foo%26name%3DBar", 33).get();
+        assertThat(response).isEqualTo(new Pojo("Foo%26name%3DBar", 33));
     }
 
     @Test
@@ -321,11 +367,17 @@ public class ArmeriaCallFactoryTest {
 
         response = service.queryStringEncoded("Foo+Bar", 33).get();
         assertThat(response).isEqualTo(new Pojo("Foo Bar", 33));
+
+        response = service.queryStringEncoded("Foo&name=Bar", 33).get();
+        assertThat(response).isEqualTo(new Pojo("Foo&name=Bar", 33));
+
+        response = service.queryStringEncoded("Foo%26name%3DBar", 33).get();
+        assertThat(response).isEqualTo(new Pojo("Foo&name=Bar", 33));
     }
 
     @Test
     public void post() throws Exception {
-        Response<Void> response = service.post(new Pojo("Cony", 26)).get();
+        final Response<Void> response = service.post(new Pojo("Cony", 26)).get();
         assertThat(response.isSuccessful()).isTrue();
     }
 
@@ -345,14 +397,14 @@ public class ArmeriaCallFactoryTest {
 
     @Test
     public void pojo_returnCall() throws Exception {
-        Pojo pojo = service.pojoReturnCall().execute().body();
+        final Pojo pojo = service.pojoReturnCall().execute().body();
         assertThat(pojo).isEqualTo(new Pojo("Cony", 26));
     }
 
     @Test
     public void pojo_returnCallCancelBeforeEnqueue() throws Exception {
-        CountDownLatch countDownLatch = new CountDownLatch(1);
-        Call<Pojo> pojoCall = service.pojoReturnCall();
+        final CountDownLatch countDownLatch = new CountDownLatch(1);
+        final Call<Pojo> pojoCall = service.pojoReturnCall();
         pojoCall.cancel();
         pojoCall.enqueue(new Callback<Pojo>() {
             @Override
@@ -369,9 +421,9 @@ public class ArmeriaCallFactoryTest {
 
     @Test
     public void pojo_returnCallCancelAfterComplete() throws Exception {
-        CountDownLatch countDownLatch = new CountDownLatch(1);
-        AtomicInteger failCount = new AtomicInteger(0);
-        Call<Pojo> pojoCall = service.pojoReturnCall();
+        final CountDownLatch countDownLatch = new CountDownLatch(1);
+        final AtomicInteger failCount = new AtomicInteger(0);
+        final Call<Pojo> pojoCall = service.pojoReturnCall();
         pojoCall.enqueue(new Callback<Pojo>() {
             @Override
             public void onResponse(Call<Pojo> call, Response<Pojo> response) {
@@ -390,7 +442,7 @@ public class ArmeriaCallFactoryTest {
 
     @Test
     public void respectsHttpClientUri() throws Exception {
-        Response<Pojo> response = service.postForm("Cony", 26).get();
+        final Response<Pojo> response = service.postForm("Cony", 26).get();
         assertThat(response.raw().request().url()).isEqualTo(
                 new HttpUrl.Builder().scheme("http")
                                      .host("127.0.0.1")
@@ -404,13 +456,13 @@ public class ArmeriaCallFactoryTest {
         EndpointGroupRegistry.register("foo",
                                        new StaticEndpointGroup(Endpoint.of("127.0.0.1", server.httpPort())),
                                        ROUND_ROBIN);
-        Service service = new ArmeriaRetrofitBuilder()
+        final Service service = new ArmeriaRetrofitBuilder()
                 .baseUrl("http://group:foo/")
                 .addConverterFactory(JacksonConverterFactory.create(OBJECT_MAPPER))
                 .addCallAdapterFactory(Java8CallAdapterFactory.create())
                 .build()
                 .create(Service.class);
-        Response<Pojo> response = service.postForm("Cony", 26).get();
+        final Response<Pojo> response = service.postForm("Cony", 26).get();
         // TODO(ide) Use the actual `host:port`. See https://github.com/line/armeria/issues/379
         assertThat(response.raw().request().url()).isEqualTo(
                 new HttpUrl.Builder().scheme("http")
@@ -424,13 +476,13 @@ public class ArmeriaCallFactoryTest {
         EndpointGroupRegistry.register("bar",
                                        new StaticEndpointGroup(Endpoint.of("127.0.0.1", server.httpPort())),
                                        ROUND_ROBIN);
-        Service service = new ArmeriaRetrofitBuilder()
+        final Service service = new ArmeriaRetrofitBuilder()
                 .baseUrl("http://group:foo/")
                 .addConverterFactory(JacksonConverterFactory.create(OBJECT_MAPPER))
                 .addCallAdapterFactory(Java8CallAdapterFactory.create())
                 .build()
                 .create(Service.class);
-        Pojo pojo = service.fullUrl("http://group_bar/pojo").get();
+        final Pojo pojo = service.fullUrl("http://group_bar/pojo").get();
         assertThat(pojo).isEqualTo(new Pojo("Cony", 26));
     }
 
@@ -450,19 +502,19 @@ public class ArmeriaCallFactoryTest {
 
     @Test
     public void sessionProtocolH1C() throws Exception {
-        Service service = new ArmeriaRetrofitBuilder()
+        final Service service = new ArmeriaRetrofitBuilder()
                 .baseUrl("h1c://127.0.0.1:" + server.httpPort())
                 .addConverterFactory(JacksonConverterFactory.create(OBJECT_MAPPER))
                 .addCallAdapterFactory(Java8CallAdapterFactory.create())
                 .build()
                 .create(Service.class);
-        Pojo pojo = service.pojo().get();
+        final Pojo pojo = service.pojo().get();
         assertThat(pojo).isEqualTo(new Pojo("Cony", 26));
     }
 
     @Test
     public void baseUrlContainsPath() throws Exception {
-        Service service = new ArmeriaRetrofitBuilder()
+        final Service service = new ArmeriaRetrofitBuilder()
                 .baseUrl(server.uri("/nest/"))
                 .addConverterFactory(JacksonConverterFactory.create(OBJECT_MAPPER))
                 .addCallAdapterFactory(Java8CallAdapterFactory.create())
@@ -476,8 +528,9 @@ public class ArmeriaCallFactoryTest {
     public void customPath() throws Exception {
         assertThat(service.customPath("Foo", 23).get()).isEqualTo(new Pojo("Foo", 23));
         assertThat(service.customPath("Foo+Bar", 24).get()).isEqualTo(new Pojo("Foo+Bar", 24));
-        assertThat(service.customPath("Foo+Bar/Hoge", 24).get()).isEqualTo(new Pojo("Foo+Bar%2FHoge", 24));
-        assertThat(service.customPath("Foo%2BBar", 24).get()).isEqualTo(new Pojo("Foo%252BBar", 24));
+        assertThat(service.customPath("Foo+Bar/Hoge", 24).get()).isEqualTo(new Pojo("Foo+Bar/Hoge", 24));
+        assertThat(service.customPath("Foo+Bar%2fHoge", 24).get()).isEqualTo(new Pojo("Foo+Bar%252fHoge", 24));
+        assertThat(service.customPath("Foo%2bBar", 24).get()).isEqualTo(new Pojo("Foo%252bBar", 24));
     }
 
     @Test
@@ -489,9 +542,14 @@ public class ArmeriaCallFactoryTest {
     }
 
     @Test
+    public void customHeaders() throws Exception {
+        assertThat(service.customHeaders("foo", "bar").get()).isEqualTo(new Pojo("Cony", 26));
+    }
+
+    @Test
     public void customNewClientFunction() throws Exception {
-        AtomicInteger counter = new AtomicInteger();
-        Service service = new ArmeriaRetrofitBuilder()
+        final AtomicInteger counter = new AtomicInteger();
+        final Service service = new ArmeriaRetrofitBuilder()
                 .baseUrl("h1c://127.0.0.1:" + server.httpPort())
                 .addConverterFactory(JacksonConverterFactory.create(OBJECT_MAPPER))
                 .addCallAdapterFactory(Java8CallAdapterFactory.create())
@@ -516,7 +574,7 @@ public class ArmeriaCallFactoryTest {
      */
     @Test
     public void nullContentType() throws Exception {
-        Response<Void> response = service.postCustomContentType(null).get();
+        final Response<Void> response = service.postCustomContentType(null).get();
         assertThat(response.code()).isEqualTo(200);
     }
 }

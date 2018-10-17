@@ -16,6 +16,8 @@
 
 package com.linecorp.armeria.client.tracing;
 
+import static com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext.ensureScopeUsesRequestContext;
+
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
@@ -31,9 +33,9 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
+import com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext;
 import com.linecorp.armeria.internal.tracing.AsciiStringKeyFactory;
 import com.linecorp.armeria.internal.tracing.SpanContextUtil;
-import com.linecorp.armeria.internal.tracing.SpanTags;
 
 import brave.Span;
 import brave.Span.Kind;
@@ -41,8 +43,6 @@ import brave.Tracer;
 import brave.Tracer.SpanInScope;
 import brave.Tracing;
 import brave.propagation.TraceContext;
-import io.netty.util.concurrent.FastThreadLocal;
-import zipkin2.Endpoint;
 
 /**
  * Decorates a {@link Client} to trace outbound {@link HttpRequest}s using
@@ -52,8 +52,6 @@ import zipkin2.Endpoint;
  * correspond to <a href="http://zipkin.io/">Zipkin</a>.
  */
 public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpResponse> {
-
-    private static final FastThreadLocal<SpanInScope> SPAN_IN_THREAD = new FastThreadLocal<>();
 
     /**
      * Creates a new tracing {@link Client} decorator using the specified {@link Tracing} instance.
@@ -69,6 +67,7 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
     public static Function<Client<HttpRequest, HttpResponse>, HttpTracingClient> newDecorator(
             Tracing tracing,
             @Nullable String remoteServiceName) {
+        ensureScopeUsesRequestContext(tracing);
         return delegate -> new HttpTracingClient(delegate, tracing, remoteServiceName);
     }
 
@@ -83,7 +82,7 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
     protected HttpTracingClient(Client<HttpRequest, HttpResponse> delegate, Tracing tracing,
                                 @Nullable String remoteServiceName) {
         super(delegate);
-        this.tracer = tracing.tracer();
+        tracer = tracing.tracer();
         injector = tracing.propagationFactory().create(AsciiStringKeyFactory.INSTANCE)
                           .injector(HttpHeaders::set);
         this.remoteServiceName = remoteServiceName;
@@ -91,7 +90,7 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
 
     @Override
     public HttpResponse execute(ClientRequestContext ctx, HttpRequest req) throws Exception {
-        Span span = tracer.nextSpan();
+        final Span span = tracer.nextSpan();
         injector.inject(span.context(), req.headers());
         // For no-op spans, we only need to inject into headers and don't set any other attributes.
         if (span.isNoop()) {
@@ -101,7 +100,8 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
         final String method = ctx.method().name();
         span.kind(Kind.CLIENT).name(method).start();
 
-        SpanContextUtil.setupContext(SPAN_IN_THREAD, ctx, span, tracer);
+        // Ensure the trace context propagates to children
+        ctx.onChild(RequestContextCurrentTraceContext::copy);
 
         ctx.log().addListener(log -> finishSpan(span, log), RequestLogAvailability.COMPLETE);
 
@@ -112,33 +112,42 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
 
     private void finishSpan(Span span, RequestLog log) {
         setRemoteEndpoint(span, log);
-        SpanTags.addTags(span, log);
-        span.finish();
+        SpanContextUtil.closeSpan(span, log);
     }
 
     private void setRemoteEndpoint(Span span, RequestLog log) {
 
-        SocketAddress remoteAddress = log.context().remoteAddress();
+        final SocketAddress remoteAddress = log.context().remoteAddress();
         final InetAddress address;
+        final int port;
         if (remoteAddress instanceof InetSocketAddress) {
-            address = ((InetSocketAddress) remoteAddress).getAddress();
+            final InetSocketAddress socketAddress = (InetSocketAddress) remoteAddress;
+            address = socketAddress.getAddress();
+            port = socketAddress.getPort();
         } else {
             address = null;
+            port = 0;
         }
 
         final String remoteServiceName;
         if (this.remoteServiceName != null) {
             remoteServiceName = this.remoteServiceName;
-        } else if (log.host() != null) {
-            remoteServiceName = log.host();
         } else {
-            remoteServiceName = null;
+            final String authority = log.requestHeaders().authority();
+            if (!"?".equals(authority)) {
+                remoteServiceName = authority;
+            } else if (address != null) {
+                remoteServiceName = String.valueOf(remoteAddress);
+            } else {
+                remoteServiceName = null;
+            }
         }
 
-        if (remoteServiceName == null && address == null) {
-            return;
+        if (remoteServiceName != null) {
+            span.remoteServiceName(remoteServiceName);
         }
-
-        span.remoteEndpoint(Endpoint.newBuilder().serviceName(remoteServiceName).ip(address).build());
+        if (address != null) {
+            span.remoteIpAndPort(address.getHostAddress(), port);
+        }
     }
 }

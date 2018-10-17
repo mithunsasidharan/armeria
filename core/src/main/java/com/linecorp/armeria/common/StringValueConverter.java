@@ -34,6 +34,8 @@ import java.time.Instant;
 import java.util.Calendar;
 import java.util.Date;
 
+import javax.annotation.Nullable;
+
 import io.netty.handler.codec.DateFormatter;
 import io.netty.handler.codec.ValueConverter;
 
@@ -49,8 +51,10 @@ final class StringValueConverter implements ValueConverter<String> {
 
     private StringValueConverter() {}
 
+    @Nullable
     @Override
-    public String convertObject(Object value) {
+    @SuppressWarnings("UseOfObsoleteDateTimeApi")
+    public String convertObject(@Nullable Object value) {
         if (value == null) {
             return null;
         }
@@ -147,6 +151,7 @@ final class StringValueConverter implements ValueConverter<String> {
 
     @Override
     public long convertToTimeMillis(String value) {
+        @SuppressWarnings("UseOfObsoleteDateTimeApi")
         final Date date = DateFormatter.parseHttpDate(value);
         if (date == null) {
             throw new IllegalArgumentException("not a date: " + value);

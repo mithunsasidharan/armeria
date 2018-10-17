@@ -18,6 +18,7 @@ package com.linecorp.armeria.client.tracing;
 
 import static com.linecorp.armeria.common.SessionProtocol.H2C;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -25,6 +26,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.concurrent.TimeUnit;
+
+import javax.annotation.Nullable;
 
 import org.junit.After;
 import org.junit.Test;
@@ -45,6 +48,7 @@ import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.metric.NoopMeterRegistry;
 import com.linecorp.armeria.common.tracing.HelloService;
+import com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext;
 import com.linecorp.armeria.common.tracing.SpanCollectingReporter;
 
 import brave.Tracing;
@@ -65,23 +69,38 @@ public class HttpTracingClientTest {
         Tracing.current().close();
     }
 
+    @Test
+    public void newDecorator_shouldFailFastWhenRequestContextCurrentTraceContextNotConfigured() {
+        assertThatThrownBy(() -> HttpTracingClient.newDecorator(Tracing.newBuilder().build()))
+                .isInstanceOf(IllegalStateException.class).hasMessage(
+                "Tracing.currentTraceContext is not a RequestContextCurrentTraceContext scope. " +
+                "Please call Tracing.Builder.currentTraceContext(RequestContextCurrentTraceContext.INSTANCE)."
+        );
+    }
+
+    @Test
+    public void newDecorator_shouldWorkWhenRequestContextCurrentTraceContextConfigured() {
+        HttpTracingClient.newDecorator(
+                Tracing.newBuilder().currentTraceContext(RequestContextCurrentTraceContext.DEFAULT).build());
+    }
+
     @Test(timeout = 20000)
     public void shouldSubmitSpanWhenSampled() throws Exception {
-        SpanCollectingReporter reporter = new SpanCollectingReporter();
+        final SpanCollectingReporter reporter = new SpanCollectingReporter();
 
-        Tracing tracing = Tracing.newBuilder()
-                                 .localServiceName(TEST_SERVICE)
-                                 .spanReporter(reporter)
-                                 .sampler(Sampler.create(1.0f))
-                                 .build();
+        final Tracing tracing = Tracing.newBuilder()
+                                       .localServiceName(TEST_SERVICE)
+                                       .spanReporter(reporter)
+                                       .sampler(Sampler.create(1.0f))
+                                       .build();
         testRemoteInvocation(tracing, null);
 
         // check span name
-        Span span = reporter.spans().take();
+        final Span span = reporter.spans().take();
         assertThat(span.name()).isEqualTo(TEST_SPAN);
 
         // check kind
-        assertThat(span.kind() == Kind.CLIENT);
+        assertThat(span.kind()).isSameAs(Kind.CLIENT);
 
         // only one span should be submitted
         assertThat(reporter.spans().poll(1, TimeUnit.SECONDS)).isNull();
@@ -91,66 +110,67 @@ public class HttpTracingClientTest {
 
         // check tags
         assertThat(span.tags()).containsAllEntriesOf(ImmutableMap.of(
-                "http.host", "localhost",
+                "http.host", "foo.com",
                 "http.method", "POST",
                 "http.path", "/hello/armeria",
                 "http.status_code", "200",
-                "http.url", "none+h2c://localhost/hello/armeria"));
+                "http.url", "none+h2c://foo.com/hello/armeria"));
 
         // check service name
         assertThat(span.localServiceName()).isEqualTo(TEST_SERVICE);
 
         // check remote service name
-        assertThat(span.remoteServiceName()).isEqualTo("localhost");
+        assertThat(span.remoteServiceName()).isEqualTo("foo.com");
     }
 
     @Test(timeout = 20000)
     public void shouldSubmitSpanWithCustomRemoteName() throws Exception {
-        SpanCollectingReporter reporter = new SpanCollectingReporter();
+        final SpanCollectingReporter reporter = new SpanCollectingReporter();
 
-        Tracing tracing = Tracing.newBuilder()
-                                 .localServiceName(TEST_SERVICE)
-                                 .spanReporter(reporter)
-                                 .sampler(Sampler.create(1.0f))
-                                 .build();
-        testRemoteInvocation(tracing, "foo");
+        final Tracing tracing = Tracing.newBuilder()
+                                       .localServiceName(TEST_SERVICE)
+                                       .spanReporter(reporter)
+                                       .sampler(Sampler.create(1.0f))
+                                       .build();
+        testRemoteInvocation(tracing, "fooService");
 
         // check span name
-        Span span = reporter.spans().take();
+        final Span span = reporter.spans().take();
 
         // check tags
         assertThat(span.tags()).containsAllEntriesOf(ImmutableMap.of(
-                "http.host", "localhost",
+                "http.host", "foo.com",
                 "http.method", "POST",
                 "http.path", "/hello/armeria",
                 "http.status_code", "200",
-                "http.url", "none+h2c://localhost/hello/armeria"));
+                "http.url", "none+h2c://foo.com/hello/armeria"));
 
         // check service name
         assertThat(span.localServiceName()).isEqualTo(TEST_SERVICE);
 
-        // check remote service name
-        assertThat(span.remoteServiceName()).isEqualTo("foo");
+        // check remote service name, lower-cased
+        assertThat(span.remoteServiceName()).isEqualTo("fooservice");
     }
 
     @Test
     public void shouldNotSubmitSpanWhenNotSampled() throws Exception {
-        SpanCollectingReporter reporter = new SpanCollectingReporter();
-        Tracing tracing = Tracing.newBuilder()
-                                 .localServiceName(TEST_SERVICE)
-                                 .spanReporter(reporter)
-                                 .sampler(Sampler.create(0.0f))
-                                 .build();
+        final SpanCollectingReporter reporter = new SpanCollectingReporter();
+        final Tracing tracing = Tracing.newBuilder()
+                                       .localServiceName(TEST_SERVICE)
+                                       .spanReporter(reporter)
+                                       .sampler(Sampler.create(0.0f))
+                                       .build();
         testRemoteInvocation(tracing, null);
 
         assertThat(reporter.spans().poll(1, TimeUnit.SECONDS)).isNull();
     }
 
-    private static void testRemoteInvocation(Tracing tracing, String remoteServiceName)
+    private static void testRemoteInvocation(Tracing tracing, @Nullable String remoteServiceName)
             throws Exception {
 
         // prepare parameters
-        final HttpRequest req = HttpRequest.of(HttpMethod.POST, "/hello/armeria");
+        final HttpRequest req = HttpRequest.of(HttpHeaders.of(HttpMethod.POST, "/hello/armeria")
+                                                          .authority("foo.com"));
         final RpcRequest rpcReq = RpcRequest.of(HelloService.Iface.class, "hello", "Armeria");
         final HttpResponse res = HttpResponse.of(HttpStatus.OK);
         final RpcResponse rpcRes = RpcResponse.of("Hello, Armeria!");
@@ -158,18 +178,19 @@ public class HttpTracingClientTest {
                 new DefaultEventLoop(), NoopMeterRegistry.get(), H2C, Endpoint.of("localhost", 8080),
                 HttpMethod.POST, "/hello/armeria", null, null, ClientOptions.DEFAULT, req);
 
-        ctx.logBuilder().startRequest(mock(Channel.class), H2C, "localhost");
+        ctx.logBuilder().startRequest(mock(Channel.class), H2C);
+        ctx.logBuilder().requestHeaders(req.headers());
         ctx.logBuilder().requestContent(rpcReq, req);
         ctx.logBuilder().endRequest();
 
         @SuppressWarnings("unchecked")
-        Client<HttpRequest, HttpResponse> delegate = mock(Client.class);
+        final Client<HttpRequest, HttpResponse> delegate = mock(Client.class);
         when(delegate.execute(any(), any())).thenReturn(res);
 
-        HttpTracingClient stub = new HttpTracingClient(delegate, tracing, remoteServiceName);
+        final HttpTracingClient stub = new HttpTracingClient(delegate, tracing, remoteServiceName);
 
         // do invoke
-        HttpResponse actualRes = stub.execute(ctx, req);
+        final HttpResponse actualRes = stub.execute(ctx, req);
 
         assertThat(actualRes).isEqualTo(res);
 

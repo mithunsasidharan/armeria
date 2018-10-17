@@ -29,6 +29,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Ticker;
 
 /**
@@ -84,18 +85,6 @@ final class NonBlockingCircuitBreaker implements CircuitBreaker {
     }
 
     @Override
-    public void onFailure(Throwable cause) {
-        try {
-            if (cause != null && !config.exceptionFilter().shouldDealWith(cause)) {
-                return;
-            }
-        } catch (Exception e) {
-            logger.error("an exception has occured when calling an ExceptionFilter", e);
-        }
-        onFailure();
-    }
-
-    @Override
     public void onFailure() {
         final State currentState = state.get();
         if (currentState.isClosed()) {
@@ -133,7 +122,9 @@ final class NonBlockingCircuitBreaker implements CircuitBreaker {
         if (currentState.isClosed()) {
             // all requests are allowed during CLOSED
             return true;
-        } else if (currentState.isHalfOpen() || currentState.isOpen()) {
+        }
+
+        if (currentState.isHalfOpen() || currentState.isOpen()) {
             if (currentState.checkTimeout() && state.compareAndSet(currentState, newHalfOpenState())) {
                 // changes to HALF_OPEN if OPEN state has timed out
                 logStateTransition(CircuitState.HALF_OPEN, null);
@@ -144,6 +135,7 @@ final class NonBlockingCircuitBreaker implements CircuitBreaker {
             notifyRequestRejected();
             return false;
         }
+
         return true;
     }
 
@@ -186,12 +178,12 @@ final class NonBlockingCircuitBreaker implements CircuitBreaker {
             try {
                 listener.onStateChanged(this, circuitState);
             } catch (Throwable t) {
-                logger.warn("An error occured when notifying a state changed event", t);
+                logger.warn("An error occurred when notifying a StateChanged event", t);
             }
             try {
                 listener.onEventCountUpdated(this, EventCount.ZERO);
             } catch (Throwable t) {
-                logger.warn("An error occured when notifying an EventCount updated event", t);
+                logger.warn("An error occurred when notifying an EventCountUpdated event", t);
             }
         });
     }
@@ -201,7 +193,7 @@ final class NonBlockingCircuitBreaker implements CircuitBreaker {
             try {
                 listener.onEventCountUpdated(this, count);
             } catch (Throwable t) {
-                logger.warn("An error occured when notifying an EventCount updated event", t);
+                logger.warn("An error occurred when notifying an EventCountUpdated event", t);
             }
         });
     }
@@ -211,7 +203,7 @@ final class NonBlockingCircuitBreaker implements CircuitBreaker {
             try {
                 listener.onRequestRejected(this);
             } catch (Throwable t) {
-                logger.warn("An error occured when notifying a request rejected event", t);
+                logger.warn("An error occurred when notifying a RequestRejected event", t);
             }
         });
     }
@@ -294,5 +286,13 @@ final class NonBlockingCircuitBreaker implements CircuitBreaker {
         public Optional<EventCount> onFailure() {
             return Optional.empty();
         }
+    }
+
+    @Override
+    public String toString() {
+        return MoreObjects.toStringHelper(this)
+                          .add("name", name)
+                          .add("config", config)
+                          .toString();
     }
 }

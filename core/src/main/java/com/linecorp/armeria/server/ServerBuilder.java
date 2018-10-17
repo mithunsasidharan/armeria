@@ -16,7 +16,11 @@
 
 package com.linecorp.armeria.server;
 
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
 import static com.linecorp.armeria.common.SessionProtocol.HTTP;
+import static com.linecorp.armeria.common.SessionProtocol.HTTPS;
+import static com.linecorp.armeria.common.SessionProtocol.PROXY;
 import static com.linecorp.armeria.server.ServerConfig.validateDefaultMaxRequestLength;
 import static com.linecorp.armeria.server.ServerConfig.validateDefaultRequestTimeoutMillis;
 import static com.linecorp.armeria.server.ServerConfig.validateNonNegative;
@@ -24,18 +28,22 @@ import static java.util.Objects.requireNonNull;
 
 import java.io.File;
 import java.net.InetSocketAddress;
+import java.security.cert.CertificateException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executor;
-import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import javax.annotation.Nullable;
 import javax.net.ssl.SSLException;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
 import com.linecorp.armeria.common.CommonPools;
 import com.linecorp.armeria.common.Flags;
@@ -43,16 +51,21 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.SessionProtocol;
-import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.server.annotation.ExceptionHandlerFunction;
 import com.linecorp.armeria.server.annotation.RequestConverterFunction;
 import com.linecorp.armeria.server.annotation.ResponseConverterFunction;
-import com.linecorp.armeria.server.logging.AccessLogWriters;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Metrics;
+import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.epoll.EpollChannelOption;
 import io.netty.handler.ssl.SslContext;
+import io.netty.util.DomainNameMapping;
+import io.netty.util.DomainNameMappingBuilder;
+import io.netty.util.concurrent.GlobalEventExecutor;
+import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
 
 /**
  * Builds a new {@link Server} and its {@link ServerConfig}.
@@ -60,7 +73,7 @@ import io.netty.handler.ssl.SslContext;
  * <pre>{@code
  * ServerBuilder sb = new ServerBuilder();
  * // Add a port to listen
- * sb.port(8080, SessionProtocol.HTTP);
+ * sb.http(8080);
  * // Build and add a virtual host.
  * sb.virtualHost(new VirtualHostBuilder("*.foo.com").service(...).build());
  * // Add services to the default virtual host.
@@ -74,26 +87,48 @@ import io.netty.handler.ssl.SslContext;
  * <pre>{@code
  * ServerBuilder sb = new ServerBuilder();
  * Server server =
- *      sb.port(8080, SessionProtocol.HTTP) // Add a port to listen
- *      .withDefaultVirtualHost() // Add services to the default virtual host.
- *          .service(...)
- *          .serviceUnder(...)
- *      .and().withVirtualHost("*.foo.com") // Add a another virtual host.
- *          .service(...)
- *          .serviceUnder(...)
- *      .and().build(); // Build a server.
+ *     sb.http(8080) // Add a port to listen
+ *       .withDefaultVirtualHost() // Add services to the default virtual host.
+ *           .service(...)
+ *           .serviceUnder(...)
+ *       .and().withVirtualHost("*.foo.com") // Add a another virtual host.
+ *           .service(...)
+ *           .serviceUnder(...)
+ *       .and().build(); // Build a server.
  * }</pre>
+ *
+ *
+ * <h2 id="no_port_specified">What happens if no HTTP(S) port is specified?</h2>
+ *
+ * <p>When no TCP/IP port number or local address is specified, {@link ServerBuilder} will automatically bind
+ * to a random TCP/IP port assigned by the OS. It will serve HTTPS if you configured TLS (or HTTP otherwise),
+ * e.g.
+ *
+ * <pre>{@code
+ * // Build an HTTP server that runs on an ephemeral TCP/IP port.
+ * Server httpServer = new ServerBuilder().service(...).build();
+ *
+ * // Build an HTTPS server that runs on an ephemeral TCP/IP port.
+ * Server httpsServer = new ServerBuilder().tls(...).service(...).build();
+ * }</pre>
+ *
  * @see VirtualHostBuilder
  */
 public final class ServerBuilder {
-
-    // Use Integer.MAX_VALUE not to limit open connections by default.
-    private static final int DEFAULT_MAX_NUM_CONNECTIONS = Integer.MAX_VALUE;
 
     // Defaults to no graceful shutdown.
     private static final Duration DEFAULT_GRACEFUL_SHUTDOWN_QUIET_PERIOD = Duration.ZERO;
     private static final Duration DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT = Duration.ZERO;
     private static final String DEFAULT_SERVICE_LOGGER_PREFIX = "armeria.services";
+    private static final int PROXY_PROTOCOL_DEFAULT_MAX_TLV_SIZE = 65535 - 216;
+
+    // Prohibit deprecate option
+    @SuppressWarnings("deprecation")
+    private static final Set<ChannelOption<?>> PROHIBITED_SOCKET_OPTIONS = ImmutableSet.of(
+            ChannelOption.ALLOW_HALF_CLOSURE, ChannelOption.AUTO_READ,
+            ChannelOption.AUTO_CLOSE, ChannelOption.MAX_MESSAGES_PER_READ,
+            ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK, ChannelOption.WRITE_BUFFER_LOW_WATER_MARK,
+            EpollChannelOption.EPOLL_MODE);
 
     private final List<ServerPort> ports = new ArrayList<>();
     private final List<ServerListener> serverListeners = new ArrayList<>();
@@ -101,70 +136,238 @@ public final class ServerBuilder {
     private final List<ChainedVirtualHostBuilder> virtualHostBuilders = new ArrayList<>();
     private final ChainedVirtualHostBuilder defaultVirtualHostBuilder = new ChainedVirtualHostBuilder(this);
     private boolean updatedDefaultVirtualHostBuilder;
+    private RejectedPathMappingHandler rejectedPathMappingHandler = RejectedPathMappingHandler.WARN;
 
+    @Nullable
     private VirtualHost defaultVirtualHost;
     private EventLoopGroup workerGroup = CommonPools.workerGroup();
     private boolean shutdownWorkerGroupOnStop;
-    private int maxNumConnections = DEFAULT_MAX_NUM_CONNECTIONS;
+    private Executor startStopExecutor = GlobalEventExecutor.INSTANCE;
+    private final Map<ChannelOption<?>, Object> channelOptions = new Object2ObjectArrayMap<>();
+    private final Map<ChannelOption<?>, Object> childChannelOptions = new Object2ObjectArrayMap<>();
+    private int maxNumConnections = Flags.maxNumConnections();
     private long idleTimeoutMillis = Flags.defaultServerIdleTimeoutMillis();
     private long defaultRequestTimeoutMillis = Flags.defaultRequestTimeoutMillis();
     private long defaultMaxRequestLength = Flags.defaultMaxRequestLength();
     private int maxHttp1InitialLineLength = Flags.defaultMaxHttp1InitialLineLength();
     private int maxHttp1HeaderSize = Flags.defaultMaxHttp1HeaderSize();
     private int maxHttp1ChunkSize = Flags.defaultMaxHttp1ChunkSize();
+    private int proxyProtocolMaxTlvSize = PROXY_PROTOCOL_DEFAULT_MAX_TLV_SIZE;
     private Duration gracefulShutdownQuietPeriod = DEFAULT_GRACEFUL_SHUTDOWN_QUIET_PERIOD;
     private Duration gracefulShutdownTimeout = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT;
     private Executor blockingTaskExecutor = CommonPools.blockingTaskExecutor();
     private MeterRegistry meterRegistry = Metrics.globalRegistry;
     private String serviceLoggerPrefix = DEFAULT_SERVICE_LOGGER_PREFIX;
-    private Consumer<RequestLog> accessLogWriter = AccessLogWriters.disabled();
+    private AccessLogWriter accessLogWriter = AccessLogWriter.disabled();
+    private boolean shutdownAccessLogWriterOnStop = true;
 
+    @Nullable
     private Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> decorator;
 
     /**
-     * Adds a new {@link ServerPort} that listens to the specified {@code port} of all available network
-     * interfaces using the specified protocol. If no port is added (i.e. no {@code port()} method is called),
-     * a default of {@code 0} (randomly-assigned port) and {@code "http"} will be used.
+     * Adds an HTTP port that listens on all available network interfaces.
+     *
+     * @param port the HTTP port number.
+     *
+     * @see #http(InetSocketAddress)
+     * @see <a href="#no_port_specified">What happens if no HTTP(S) port is specified?</a>
      */
+    public ServerBuilder http(int port) {
+        return port(new ServerPort(port, HTTP));
+    }
+
+    /**
+     * Adds an HTTP port that listens to the specified {@code localAddress}.
+     *
+     * @param localAddress the local address to bind
+     *
+     * @see #http(int)
+     * @see <a href="#no_port_specified">What happens if no HTTP(S) port is specified?</a>
+     */
+    public ServerBuilder http(InetSocketAddress localAddress) {
+        return port(new ServerPort(requireNonNull(localAddress, "localAddress"), HTTP));
+    }
+
+    /**
+     * Adds an HTTPS port that listens on all available network interfaces.
+     *
+     * @param port the HTTPS port number.
+     *
+     * @see #https(InetSocketAddress)
+     * @see <a href="#no_port_specified">What happens if no HTTP(S) port is specified?</a>
+     */
+    public ServerBuilder https(int port) {
+        return port(new ServerPort(port, HTTPS));
+    }
+
+    /**
+     * Adds an HTTPS port that listens to the specified {@code localAddress}.
+     *
+     * @param localAddress the local address to bind
+     *
+     * @see #http(int)
+     * @see <a href="#no_port_specified">What happens if no HTTP(S) port is specified?</a>
+     */
+    public ServerBuilder https(InetSocketAddress localAddress) {
+        return port(new ServerPort(requireNonNull(localAddress, "localAddress"), HTTPS));
+    }
+
+    /**
+     * Adds a new {@link ServerPort} that listens to the specified {@code port} of all available network
+     * interfaces using the specified protocol.
+     *
+     * @deprecated Use {@link #http(int)} or {@link #https(int)}.
+     * @see <a href="#no_port_specified">What happens if no HTTP(S) port is specified?</a>
+     */
+    @Deprecated
     public ServerBuilder port(int port, String protocol) {
         return port(port, SessionProtocol.of(requireNonNull(protocol, "protocol")));
     }
 
     /**
      * Adds a new {@link ServerPort} that listens to the specified {@code port} of all available network
-     * interfaces using the specified {@link SessionProtocol}. If no port is added (i.e. no {@code port()}
-     * method is called), a default of {@code 0} (randomly-assigned port) and {@code "http"} will be used.
+     * interfaces using the specified {@link SessionProtocol}s. Specify multiple protocols to serve more than
+     * one protocol on the same port:
+     *
+     * <pre>{@code
+     * ServerBuilder sb = new ServerBuilder();
+     * // Serve both HTTP and HTTPS at port 8080.
+     * sb.port(8080,
+     *         SessionProtocol.HTTP,
+     *         SessionProtocol.HTTPS);
+     * // Enable HTTPS with PROXY protocol support at port 8443.
+     * sb.port(8443,
+     *         SessionProtocol.PROXY,
+     *         SessionProtocol.HTTPS);
+     * }</pre>
      */
-    public ServerBuilder port(int port, SessionProtocol protocol) {
-        ports.add(new ServerPort(port, protocol));
-        return this;
+    public ServerBuilder port(int port, SessionProtocol... protocols) {
+        return port(new ServerPort(port, protocols));
+    }
+
+    /**
+     * Adds a new {@link ServerPort} that listens to the specified {@code port} of all available network
+     * interfaces using the specified {@link SessionProtocol}s. Specify multiple protocols to serve more than
+     * one protocol on the same port:
+     *
+     * <pre>{@code
+     * ServerBuilder sb = new ServerBuilder();
+     * // Serve both HTTP and HTTPS at port 8080.
+     * sb.port(8080,
+     *         Arrays.asList(SessionProtocol.HTTP,
+     *                       SessionProtocol.HTTPS));
+     * // Enable HTTPS with PROXY protocol support at port 8443.
+     * sb.port(8443,
+     *         Arrays.asList(SessionProtocol.PROXY,
+     *                       SessionProtocol.HTTPS));
+     * }</pre>
+     */
+    public ServerBuilder port(int port, Iterable<SessionProtocol> protocols) {
+        return port(new ServerPort(port, protocols));
     }
 
     /**
      * Adds a new {@link ServerPort} that listens to the specified {@code localAddress} using the specified
-     * protocol. If no port is added (i.e. no {@code port()} method is called), a default of {@code 0}
-     * (randomly-assigned port) and {@code "http"} will be used.
+     * protocol.
+     *
+     * @deprecated Use {@link #http(InetSocketAddress)} or {@link #https(InetSocketAddress)}.
      */
+    @Deprecated
     public ServerBuilder port(InetSocketAddress localAddress, String protocol) {
         return port(localAddress, SessionProtocol.of(requireNonNull(protocol, "protocol")));
     }
 
     /**
      * Adds a new {@link ServerPort} that listens to the specified {@code localAddress} using the specified
-     * {@link SessionProtocol}. If no port is added (i.e. no {@code port()} method is called), a default of
-     * {@code 0} (randomly-assigned port) and {@code "http"} will be used.
+     * {@link SessionProtocol}s. Specify multiple protocols to serve more than one protocol on the same port:
+     *
+     * <pre>{@code
+     * ServerBuilder sb = new ServerBuilder();
+     * // Serve both HTTP and HTTPS at port 8080.
+     * sb.port(new InetSocketAddress(8080),
+     *         SessionProtocol.HTTP,
+     *         SessionProtocol.HTTPS);
+     * // Enable HTTPS with PROXY protocol support at port 8443.
+     * sb.port(new InetSocketAddress(8443),
+     *         SessionProtocol.PROXY,
+     *         SessionProtocol.HTTPS);
+     * }</pre>
      */
-    public ServerBuilder port(InetSocketAddress localAddress, SessionProtocol protocol) {
-        ports.add(new ServerPort(localAddress, protocol));
+    public ServerBuilder port(InetSocketAddress localAddress, SessionProtocol... protocols) {
+        return port(new ServerPort(localAddress, protocols));
+    }
+
+    /**
+     * Adds a new {@link ServerPort} that listens to the specified {@code localAddress} using the specified
+     * {@link SessionProtocol}s. Specify multiple protocols to serve more than one protocol on the same port:
+     *
+     * <pre>{@code
+     * ServerBuilder sb = new ServerBuilder();
+     * // Serve both HTTP and HTTPS at port 8080.
+     * sb.port(new InetSocketAddress(8080),
+     *         Arrays.asList(SessionProtocol.HTTP,
+     *                       SessionProtocol.HTTPS));
+     * // Enable HTTPS with PROXY protocol support at port 8443.
+     * sb.port(new InetSocketAddress(8443),
+     *         Arrays.asList(SessionProtocol.PROXY,
+     *                       SessionProtocol.HTTPS));
+     * }</pre>
+     */
+    public ServerBuilder port(InetSocketAddress localAddress, Iterable<SessionProtocol> protocols) {
+        return port(new ServerPort(localAddress, protocols));
+    }
+
+    /**
+     * Adds the specified {@link ServerPort}.
+     *
+     * @see <a href="#no_port_specified">What happens if no HTTP(S) port is specified?</a>
+     */
+    public ServerBuilder port(ServerPort port) {
+        requireNonNull(port, "port");
+        if (port.localAddress().getPort() != 0) {
+            ports.forEach(p -> checkArgument(!p.localAddress().equals(port.localAddress()),
+                                             "duplicate local address: %s", port.localAddress()));
+        }
+        ports.add(port);
         return this;
     }
 
     /**
-     * Adds the specified {@link ServerPort}. If no port is added (i.e. no {@code port()} method is called),
-     * a default of {@code 0} (randomly-assigned port) and {@code "http"} will be used.
+     * Sets the {@link ChannelOption} of the server socket bound by {@link Server}.
+     * Note that the previously added option will be overridden if the same option is set again.
+     *
+     * <pre>{@code
+     * ServerBuilder sb = new ServerBuilder();
+     * sb.channelOption(ChannelOption.BACKLOG, 1024);
+     * }</pre>
      */
-    public ServerBuilder port(ServerPort port) {
-        ports.add(requireNonNull(port, "port"));
+    public <T> ServerBuilder channelOption(ChannelOption<T> option, T value) {
+        requireNonNull(option, "option");
+        checkArgument(!PROHIBITED_SOCKET_OPTIONS.contains(option),
+                      "prohibited socket option: %s", option);
+
+        option.validate(value);
+        channelOptions.put(option, value);
+        return this;
+    }
+
+    /**
+     * Sets the {@link ChannelOption} of sockets accepted by {@link Server}.
+     * Note that the previously added option will be overridden if the same option is set again.
+     *
+     * <pre>{@code
+     * ServerBuilder sb = new ServerBuilder();
+     * sb.childChannelOption(ChannelOption.SO_REUSEADDR, true)
+     *   .childChannelOption(ChannelOption.SO_KEEPALIVE, true);
+     * }</pre>
+     */
+    public <T> ServerBuilder childChannelOption(ChannelOption<T> option, T value) {
+        requireNonNull(option, "option");
+        checkArgument(!PROHIBITED_SOCKET_OPTIONS.contains(option),
+                      "prohibited socket option: %s", option);
+
+        option.validate(value);
+        childChannelOptions.put(option, value);
         return this;
     }
 
@@ -192,11 +395,26 @@ public final class ServerBuilder {
     }
 
     /**
+     * Sets the {@link Executor} which will invoke the callbacks of {@link Server#start()},
+     * {@link Server#stop()} and {@link ServerListener}. If not set, {@link GlobalEventExecutor} will be used
+     * by default.
+     */
+    public ServerBuilder startStopExecutor(Executor startStopExecutor) {
+        this.startStopExecutor = requireNonNull(startStopExecutor, "startStopExecutor");
+        return this;
+    }
+
+    /**
      * Sets the maximum allowed number of open connections.
      */
     public ServerBuilder maxNumConnections(int maxNumConnections) {
         this.maxNumConnections = ServerConfig.validateMaxNumConnections(maxNumConnections);
         return this;
+    }
+
+    @VisibleForTesting
+    int maxNumConnections() {
+        return maxNumConnections;
     }
 
     /**
@@ -345,21 +563,36 @@ public final class ServerBuilder {
 
     /**
      * Sets the format of this {@link Server}'s access log. The specified {@code accessLogFormat} would be
-     * parsed by {@link AccessLogWriters#custom(String)}.
+     * parsed by {@link AccessLogWriter#custom(String)}.
      */
     public ServerBuilder accessLogFormat(String accessLogFormat) {
-        accessLogWriter = AccessLogWriters.custom(requireNonNull(accessLogFormat, "accessLogFormat"));
+        return accessLogWriter(AccessLogWriter.custom(requireNonNull(accessLogFormat, "accessLogFormat")),
+                               true);
+    }
+
+    /**
+     * Sets an access log writer of this {@link Server}. {@link AccessLogWriter#disabled()} is used by default.
+     *
+     * @param shutdownOnStop whether to shut down the {@link AccessLogWriter} when the {@link Server} stops
+     */
+    public ServerBuilder accessLogWriter(AccessLogWriter accessLogWriter, boolean shutdownOnStop) {
+        this.accessLogWriter = requireNonNull(accessLogWriter, "accessLogWriter");
+        shutdownAccessLogWriterOnStop = shutdownOnStop;
         return this;
     }
 
     /**
-     * Sets an access log writer of this {@link Server}. {@link AccessLogWriters#disabled()} is used by default.
+     * Sets the maximum size of additional data for PROXY protocol. The default value of this property is
+     * {@value #PROXY_PROTOCOL_DEFAULT_MAX_TLV_SIZE}.
      *
-     * @see AccessLogWriters to find pre-defined access log writers.
+     * <p><b>Note:</b> limiting TLV size only affects processing of v2, binary headers. Also, as allowed by
+     * the 1.5 spec, TLV data is currently ignored. For maximum performance, it would be best to configure
+     * your upstream proxy host to <b>NOT</b> send TLV data and set this property to {@code 0}.
      */
-    @SuppressWarnings("unchecked")
-    public ServerBuilder accessLogWriter(Consumer<? super RequestLog> accessLogWriter) {
-        this.accessLogWriter = (Consumer<RequestLog>) requireNonNull(accessLogWriter, "accessLogWriter");
+    public ServerBuilder proxyProtocolMaxTlvSize(int proxyProtocolMaxTlvSize) {
+        checkArgument(proxyProtocolMaxTlvSize >= 0,
+                      "proxyProtocolMaxTlvSize: %s (expected: >= 0)", proxyProtocolMaxTlvSize);
+        this.proxyProtocolMaxTlvSize = proxyProtocolMaxTlvSize;
         return this;
     }
 
@@ -369,9 +602,67 @@ public final class ServerBuilder {
      * @throws IllegalStateException if the default {@link VirtualHost} has been set via
      *                               {@link #defaultVirtualHost(VirtualHost)} already
      */
+    public ServerBuilder tls(SslContext sslContext) {
+        defaultVirtualHostBuilderUpdated();
+        defaultVirtualHostBuilder.tls(sslContext);
+        return this;
+    }
+
+    /**
+     * Configures SSL or TLS of the default {@link VirtualHost} from the specified {@code keyCertChainFile}
+     * and cleartext {@code keyFile}.
+     *
+     * @throws IllegalStateException if the default {@link VirtualHost} has been set via
+     *                               {@link #defaultVirtualHost(VirtualHost)} already
+     */
+    public ServerBuilder tls(File keyCertChainFile, File keyFile) throws SSLException {
+        defaultVirtualHostBuilderUpdated();
+        defaultVirtualHostBuilder.tls(keyCertChainFile, keyFile);
+        return this;
+    }
+
+    /**
+     * Configures SSL or TLS of the default {@link VirtualHost} from the specified {@code keyCertChainFile},
+     * {@code keyFile} and {@code keyPassword}.
+     *
+     * @throws IllegalStateException if the default {@link VirtualHost} has been set via
+     *                               {@link #defaultVirtualHost(VirtualHost)} already
+     */
+    public ServerBuilder tls(
+            File keyCertChainFile, File keyFile, @Nullable String keyPassword) throws SSLException {
+
+        defaultVirtualHostBuilderUpdated();
+        defaultVirtualHostBuilder.tls(keyCertChainFile, keyFile, keyPassword);
+        return this;
+    }
+
+    /**
+     * Configures SSL or TLS of the default {@link VirtualHost} with an auto-generated self-signed
+     * certificate. <strong>Note:</strong> You should never use this in production but only for a testing
+     * purpose.
+     *
+     * @throws IllegalStateException if the default {@link VirtualHost} has been set via
+     *                               {@link #defaultVirtualHost(VirtualHost)} already
+     * @throws CertificateException if failed to generate a self-signed certificate
+     */
+    public ServerBuilder tlsSelfSigned() throws SSLException, CertificateException {
+        defaultVirtualHostBuilderUpdated();
+        defaultVirtualHostBuilder.tlsSelfSigned();
+        return this;
+    }
+
+    /**
+     * Sets the {@link SslContext} of the default {@link VirtualHost}.
+     *
+     * @deprecated Use {@link #tls(SslContext)}.
+     *
+     * @throws IllegalStateException if the default {@link VirtualHost} has been set via
+     *                               {@link #defaultVirtualHost(VirtualHost)} already
+     */
+    @Deprecated
     public ServerBuilder sslContext(SslContext sslContext) {
         defaultVirtualHostBuilderUpdated();
-        defaultVirtualHostBuilder.sslContext(sslContext);
+        defaultVirtualHostBuilder.tls(sslContext);
         return this;
     }
 
@@ -379,9 +670,12 @@ public final class ServerBuilder {
      * Sets the {@link SslContext} of the default {@link VirtualHost} from the specified
      * {@link SessionProtocol}, {@code keyCertChainFile} and cleartext {@code keyFile}.
      *
+     * @deprecated Use {@link #tls(File, File)}.
+     *
      * @throws IllegalStateException if the default {@link VirtualHost} has been set via
      *                               {@link #defaultVirtualHost(VirtualHost)} already
      */
+    @Deprecated
     public ServerBuilder sslContext(
             SessionProtocol protocol, File keyCertChainFile, File keyFile) throws SSLException {
         defaultVirtualHostBuilderUpdated();
@@ -393,9 +687,12 @@ public final class ServerBuilder {
      * Sets the {@link SslContext} of the default {@link VirtualHost} from the specified
      * {@link SessionProtocol}, {@code keyCertChainFile}, {@code keyFile} and {@code keyPassword}.
      *
+     * @deprecated Use {@link #tls(File, File, String)}.
+     *
      * @throws IllegalStateException if the default {@link VirtualHost} has been set via
      *                               {@link #defaultVirtualHost(VirtualHost)} already
      */
+    @Deprecated
     public ServerBuilder sslContext(
             SessionProtocol protocol,
             File keyCertChainFile, File keyFile, String keyPassword) throws SSLException {
@@ -501,7 +798,7 @@ public final class ServerBuilder {
      */
     public <T extends ServiceWithPathMappings<HttpRequest, HttpResponse>,
             R extends Service<HttpRequest, HttpResponse>>
-    ServerBuilder service(T serviceWithPathMappings, Function<T, R> decorator) {
+    ServerBuilder service(T serviceWithPathMappings, Function<? super T, R> decorator) {
         defaultVirtualHostBuilderUpdated();
         defaultVirtualHostBuilder.service(serviceWithPathMappings, decorator);
         return this;
@@ -523,7 +820,9 @@ public final class ServerBuilder {
      */
     public ServerBuilder annotatedService(Object service,
                                           Object... exceptionHandlersAndConverters) {
-        return annotatedService("/", service, Function.identity(), exceptionHandlersAndConverters);
+        return annotatedService("/", service, Function.identity(),
+                                requireNonNull(exceptionHandlersAndConverters,
+                                               "exceptionHandlersAndConverters"));
     }
 
     /**
@@ -537,7 +836,9 @@ public final class ServerBuilder {
                                           Function<Service<HttpRequest, HttpResponse>,
                                                   ? extends Service<HttpRequest, HttpResponse>> decorator,
                                           Object... exceptionHandlersAndConverters) {
-        return annotatedService("/", service, decorator, exceptionHandlersAndConverters);
+        return annotatedService("/", service, decorator,
+                                requireNonNull(exceptionHandlersAndConverters,
+                                               "exceptionHandlersAndConverters"));
     }
 
     /**
@@ -557,7 +858,8 @@ public final class ServerBuilder {
     public ServerBuilder annotatedService(String pathPrefix, Object service,
                                           Object... exceptionHandlersAndConverters) {
         return annotatedService(pathPrefix, service, Function.identity(),
-                                exceptionHandlersAndConverters);
+                                requireNonNull(exceptionHandlersAndConverters,
+                                               "exceptionHandlersAndConverters"));
     }
 
     /**
@@ -573,7 +875,8 @@ public final class ServerBuilder {
                                           Object... exceptionHandlersAndConverters) {
 
         return annotatedService(pathPrefix, service, decorator,
-                                ImmutableList.copyOf(exceptionHandlersAndConverters));
+                                ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
+                                                                    "exceptionHandlersAndConverters")));
     }
 
     /**
@@ -608,7 +911,7 @@ public final class ServerBuilder {
      * @throws IllegalStateException
      *     if other default {@link VirtualHost} builder methods have been invoked already, including:
      *     <ul>
-     *       <li>{@link #sslContext(SslContext)}</li>
+     *       <li>{@link #tls(SslContext)}</li>
      *       <li>{@link #service(String, Service)}</li>
      *       <li>{@link #serviceUnder(String, Service)}</li>
      *       <li>{@link #service(PathMapping, Service)}</li>
@@ -654,7 +957,8 @@ public final class ServerBuilder {
      * @return {@link VirtualHostBuilder} for build the virtual host
      */
     public ChainedVirtualHostBuilder withVirtualHost(String hostnamePattern) {
-        ChainedVirtualHostBuilder virtualHostBuilder = new ChainedVirtualHostBuilder(hostnamePattern, this);
+        final ChainedVirtualHostBuilder virtualHostBuilder =
+                new ChainedVirtualHostBuilder(hostnamePattern, this);
         virtualHostBuilders.add(virtualHostBuilder);
         return virtualHostBuilder;
     }
@@ -668,7 +972,7 @@ public final class ServerBuilder {
      * @return {@link VirtualHostBuilder} for build the virtual host
      */
     public ChainedVirtualHostBuilder withVirtualHost(String defaultHostname, String hostnamePattern) {
-        ChainedVirtualHostBuilder virtualHostBuilder =
+        final ChainedVirtualHostBuilder virtualHostBuilder =
                 new ChainedVirtualHostBuilder(defaultHostname, hostnamePattern, this);
         virtualHostBuilders.add(virtualHostBuilder);
         return virtualHostBuilder;
@@ -687,7 +991,7 @@ public final class ServerBuilder {
         requireNonNull(decorator, "decorator");
 
         @SuppressWarnings("unchecked")
-        Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> castDecorator =
+        final Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> castDecorator =
                 (Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>>) decorator;
 
         if (this.decorator != null) {
@@ -700,13 +1004,19 @@ public final class ServerBuilder {
     }
 
     /**
+     * Sets the {@link RejectedPathMappingHandler} which will be invoked when an attempt to bind
+     * a {@link Service} at a certain {@link PathMapping} is rejected. By default, the duplicate
+     * mappings are logged at WARN level.
+     */
+    public ServerBuilder rejectedPathMappingHandler(RejectedPathMappingHandler handler) {
+        rejectedPathMappingHandler = requireNonNull(handler, "handler");
+        return this;
+    }
+
+    /**
      * Returns a newly-created {@link Server} based on the configuration properties set so far.
      */
     public Server build() {
-        final List<ServerPort> ports =
-                !this.ports.isEmpty() ? this.ports
-                                      : Collections.singletonList(new ServerPort(0, HTTP));
-
         final VirtualHost defaultVirtualHost;
         if (this.defaultVirtualHost != null) {
             defaultVirtualHost = this.defaultVirtualHost.decorate(decorator);
@@ -725,14 +1035,83 @@ public final class ServerBuilder {
             virtualHosts = this.virtualHosts;
         }
 
+        final List<ServerPort> ports;
+
+        // Pre-populate the domain name mapping for later matching.
+        final DomainNameMapping<SslContext> sslContexts;
+        final SslContext defaultSslContext = findDefaultSslContext(defaultVirtualHost, virtualHosts);
+
+        this.ports.forEach(
+                port -> checkState(port.protocols().stream().anyMatch(p -> p != PROXY),
+                                   "protocols: %s (expected: at least one %s or %s)",
+                                   port.protocols(), HTTP, HTTPS));
+
+        if (defaultSslContext == null) {
+            sslContexts = null;
+            if (!this.ports.isEmpty()) {
+                ports = ImmutableList.copyOf(this.ports);
+                for (final ServerPort p : ports) {
+                    if (p.hasTls()) {
+                        throw new IllegalArgumentException("TLS not configured; cannot serve HTTPS");
+                    }
+                }
+            } else {
+                ports = ImmutableList.of(new ServerPort(0, HTTP));
+            }
+        } else {
+            if (!this.ports.isEmpty()) {
+                ports = ImmutableList.copyOf(this.ports);
+            } else {
+                ports = ImmutableList.of(new ServerPort(0, HTTPS));
+            }
+
+            final DomainNameMappingBuilder<SslContext>
+                    mappingBuilder = new DomainNameMappingBuilder<>(defaultSslContext);
+            for (VirtualHost h : virtualHosts) {
+                final SslContext sslCtx = h.sslContext();
+                if (sslCtx != null) {
+                    mappingBuilder.add(h.hostnamePattern(), sslCtx);
+                }
+            }
+            sslContexts = mappingBuilder.build();
+        }
+
         final Server server = new Server(new ServerConfig(
-                ports, defaultVirtualHost, virtualHosts, workerGroup, shutdownWorkerGroupOnStop,
-                maxNumConnections, idleTimeoutMillis, defaultRequestTimeoutMillis, defaultMaxRequestLength,
+                ports, normalizeDefaultVirtualHost(defaultVirtualHost, defaultSslContext), virtualHosts,
+                workerGroup, shutdownWorkerGroupOnStop, startStopExecutor, maxNumConnections,
+                idleTimeoutMillis, defaultRequestTimeoutMillis, defaultMaxRequestLength,
                 maxHttp1InitialLineLength, maxHttp1HeaderSize, maxHttp1ChunkSize,
                 gracefulShutdownQuietPeriod, gracefulShutdownTimeout, blockingTaskExecutor,
-                meterRegistry, serviceLoggerPrefix, accessLogWriter));
+                meterRegistry, serviceLoggerPrefix, accessLogWriter, shutdownAccessLogWriterOnStop,
+                proxyProtocolMaxTlvSize, channelOptions, childChannelOptions), sslContexts);
+
         serverListeners.forEach(server::addListener);
         return server;
+    }
+
+    private VirtualHost normalizeDefaultVirtualHost(VirtualHost h,
+                                                    @Nullable SslContext defaultSslContext) {
+        final SslContext sslCtx = h.sslContext() != null ? h.sslContext() : defaultSslContext;
+        return new VirtualHost(
+                h.defaultHostname(), "*", sslCtx,
+                h.serviceConfigs().stream().map(
+                        e -> new ServiceConfig(e.pathMapping(), e.service(), e.loggerName().orElse(null)))
+                 .collect(Collectors.toList()), h.producibleMediaTypes(), rejectedPathMappingHandler);
+    }
+
+    @Nullable
+    private static SslContext findDefaultSslContext(VirtualHost defaultVirtualHost,
+                                                    List<VirtualHost> virtualHosts) {
+        SslContext lastSslContext = null;
+        for (VirtualHost h : virtualHosts) {
+            if (h.sslContext() != null) {
+                lastSslContext = h.sslContext();
+            }
+        }
+        if (defaultVirtualHost.sslContext() != null) {
+            lastSslContext = defaultVirtualHost.sslContext();
+        }
+        return lastSslContext;
     }
 
     @Override
@@ -741,7 +1120,10 @@ public final class ServerBuilder {
                 getClass(), ports, defaultVirtualHost, virtualHosts, workerGroup, shutdownWorkerGroupOnStop,
                 maxNumConnections, idleTimeoutMillis, defaultRequestTimeoutMillis, defaultMaxRequestLength,
                 maxHttp1InitialLineLength, maxHttp1HeaderSize, maxHttp1ChunkSize,
-                gracefulShutdownQuietPeriod, gracefulShutdownTimeout,
-                blockingTaskExecutor, meterRegistry, serviceLoggerPrefix, accessLogWriter);
+                proxyProtocolMaxTlvSize, gracefulShutdownQuietPeriod, gracefulShutdownTimeout,
+                blockingTaskExecutor, meterRegistry, serviceLoggerPrefix,
+                accessLogWriter, shutdownAccessLogWriterOnStop,
+                channelOptions, childChannelOptions
+        );
     }
 }

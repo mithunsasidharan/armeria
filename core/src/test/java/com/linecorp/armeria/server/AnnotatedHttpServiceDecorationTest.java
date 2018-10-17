@@ -17,8 +17,7 @@
 package com.linecorp.armeria.server;
 
 import static com.linecorp.armeria.server.AnnotatedHttpServiceTest.validateContextAndRequest;
-import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.ClassRule;
 import org.junit.Rule;
@@ -33,11 +32,12 @@ import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.common.logging.LogLevel;
 import com.linecorp.armeria.server.TestConverters.UnformattedStringConverterFunction;
 import com.linecorp.armeria.server.annotation.Decorator;
 import com.linecorp.armeria.server.annotation.Get;
 import com.linecorp.armeria.server.annotation.ResponseConverter;
-import com.linecorp.armeria.server.logging.LoggingService;
+import com.linecorp.armeria.server.annotation.decorator.LoggingDecorator;
 import com.linecorp.armeria.testing.server.ServerRule;
 
 public class AnnotatedHttpServiceDecorationTest {
@@ -46,11 +46,10 @@ public class AnnotatedHttpServiceDecorationTest {
     public static final ServerRule rule = new ServerRule() {
         @Override
         protected void configure(ServerBuilder sb) throws Exception {
-            sb.annotatedService("/1", new MyDecorationService1(),
-                                LoggingService.newDecorator());
-
-            sb.annotatedService("/2", new MyDecorationService2(),
-                                LoggingService.newDecorator());
+            sb.annotatedService("/1", new MyDecorationService1());
+            sb.annotatedService("/2", new MyDecorationService2());
+            sb.annotatedService("/3", new MyDecorationService3());
+            sb.annotatedService("/4", new MyDecorationService4());
         }
     };
 
@@ -62,6 +61,7 @@ public class AnnotatedHttpServiceDecorationTest {
         }
     };
 
+    @LoggingDecorator(requestLogLevel = LogLevel.INFO, successfulResponseLogLevel = LogLevel.INFO)
     @ResponseConverter(UnformattedStringConverterFunction.class)
     public static class MyDecorationService1 {
 
@@ -88,6 +88,7 @@ public class AnnotatedHttpServiceDecorationTest {
         }
     }
 
+    @LoggingDecorator
     @ResponseConverter(UnformattedStringConverterFunction.class)
     public static class MyDecorationService2 extends MyDecorationService1 {
 
@@ -107,10 +108,34 @@ public class AnnotatedHttpServiceDecorationTest {
         }
     }
 
+    @LoggingDecorator
+    @ResponseConverter(UnformattedStringConverterFunction.class)
+    @Decorator(AlwaysTooManyRequestsDecorator.class)
+    public static class MyDecorationService3 {
+
+        @Get("/tooManyRequests")
+        @Decorator(AlwaysLockedDecorator.class)
+        public String tooManyRequests(ServiceRequestContext ctx, HttpRequest req) {
+            validateContextAndRequest(ctx, req);
+            return "OK";
+        }
+    }
+
+    @LoggingDecorator
+    @ResponseConverter(UnformattedStringConverterFunction.class)
+    @Decorator(FallThroughDecorator.class)
+    public static class MyDecorationService4 {
+
+        @Get("/tooManyRequests")
+        @Decorator(AlwaysTooManyRequestsDecorator.class)
+        public String tooManyRequests(ServiceRequestContext ctx, HttpRequest req) {
+            validateContextAndRequest(ctx, req);
+            return "OK";
+        }
+    }
+
     public static final class AlwaysTooManyRequestsDecorator
             implements DecoratingServiceFunction<HttpRequest, HttpResponse> {
-
-        public AlwaysTooManyRequestsDecorator() {}
 
         @Override
         public HttpResponse serve(Service<HttpRequest, HttpResponse> delegate,
@@ -124,8 +149,6 @@ public class AnnotatedHttpServiceDecorationTest {
     static final class AlwaysLockedDecorator
             implements DecoratingServiceFunction<HttpRequest, HttpResponse> {
 
-        AlwaysLockedDecorator() {}
-
         @Override
         public HttpResponse serve(Service<HttpRequest, HttpResponse> delegate,
                                   ServiceRequestContext ctx,
@@ -137,8 +160,6 @@ public class AnnotatedHttpServiceDecorationTest {
 
     private static final class FallThroughDecorator
             implements DecoratingServiceFunction<HttpRequest, HttpResponse> {
-
-        private FallThroughDecorator() {}
 
         @Override
         public HttpResponse serve(Service<HttpRequest, HttpResponse> delegate,
@@ -156,27 +177,36 @@ public class AnnotatedHttpServiceDecorationTest {
         AggregatedHttpMessage response;
 
         response = client.execute(HttpHeaders.of(HttpMethod.GET, "/1/ok")).aggregate().get();
-        assertThat(response.headers().status(), is(HttpStatus.OK));
+        assertThat(response.headers().status()).isEqualTo(HttpStatus.OK);
 
         response = client.execute(HttpHeaders.of(HttpMethod.GET, "/1/tooManyRequests")).aggregate().get();
-        assertThat(response.headers().status(), is(HttpStatus.TOO_MANY_REQUESTS));
+        assertThat(response.headers().status()).isEqualTo(
+                HttpStatus.TOO_MANY_REQUESTS);
 
         response = client.execute(HttpHeaders.of(HttpMethod.GET, "/1/locked")).aggregate().get();
-        assertThat(response.headers().status(), is(HttpStatus.LOCKED));
+        assertThat(response.headers().status()).isEqualTo(HttpStatus.LOCKED);
 
         // Call inherited methods.
         response = client.execute(HttpHeaders.of(HttpMethod.GET, "/2/tooManyRequests")).aggregate().get();
-        assertThat(response.headers().status(), is(HttpStatus.TOO_MANY_REQUESTS));
+        assertThat(response.headers().status()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
 
         response = client.execute(HttpHeaders.of(HttpMethod.GET, "/2/locked")).aggregate().get();
-        assertThat(response.headers().status(), is(HttpStatus.LOCKED));
+        assertThat(response.headers().status()).isEqualTo(HttpStatus.LOCKED);
 
         // Call a new method.
         response = client.execute(HttpHeaders.of(HttpMethod.GET, "/2/added")).aggregate().get();
-        assertThat(response.headers().status(), is(HttpStatus.OK));
+        assertThat(response.headers().status()).isEqualTo(HttpStatus.OK);
 
         // Call an overriding method.
         response = client.execute(HttpHeaders.of(HttpMethod.GET, "/2/override")).aggregate().get();
-        assertThat(response.headers().status(), is(HttpStatus.TOO_MANY_REQUESTS));
+        assertThat(response.headers().status()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+
+        // Respond by the class-level decorator.
+        response = client.execute(HttpHeaders.of(HttpMethod.GET, "/3/tooManyRequests")).aggregate().get();
+        assertThat(response.headers().status()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+
+        // Respond by the method-level decorator.
+        response = client.execute(HttpHeaders.of(HttpMethod.GET, "/4/tooManyRequests")).aggregate().get();
+        assertThat(response.headers().status()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
     }
 }

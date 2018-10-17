@@ -25,10 +25,12 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
+import java.security.cert.CertificateException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;
 
+import javax.annotation.Nullable;
 import javax.net.ssl.SSLException;
 
 import org.slf4j.Logger;
@@ -42,6 +44,8 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.MediaTypeSet;
 import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.internal.crypto.BouncyCastleKeyFactoryProvider;
+import com.linecorp.armeria.server.AnnotatedHttpServiceFactory.AnnotatedHttpServiceElement;
 import com.linecorp.armeria.server.annotation.ExceptionHandlerFunction;
 import com.linecorp.armeria.server.annotation.RequestConverterFunction;
 import com.linecorp.armeria.server.annotation.ResponseConverterFunction;
@@ -56,6 +60,7 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.SupportedCipherSuiteFilter;
+import io.netty.handler.ssl.util.SelfSignedCertificate;
 
 /**
  * Contains information for the build of the virtual host.
@@ -87,15 +92,15 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
             process = Runtime.getRuntime().exec("hostname");
             final String line = new BufferedReader(new InputStreamReader(process.getInputStream())).readLine();
             if (line == null) {
-                logger.warn("The 'hostname' command returned nothing; " +
-                            "using InetAddress.getLocalHost() instead", line);
+                logger.debug("The 'hostname' command returned nothing; " +
+                             "using InetAddress.getLocalHost() instead");
             } else {
                 hostname = normalizeDefaultHostname(line.trim());
-                logger.info("Hostname: {} (via 'hostname' command)", hostname);
+                logger.info("Hostname: {} (from 'hostname' command)", hostname);
             }
         } catch (Exception e) {
-            logger.warn("Failed to get the hostname using the 'hostname' command; " +
-                        "using InetAddress.getLocalHost() instead", e);
+            logger.debug("Failed to get the hostname using the 'hostname' command; " +
+                         "using InetAddress.getLocalHost() instead", e);
         } finally {
             if (process != null) {
                 process.destroy();
@@ -105,7 +110,7 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
         if (hostname == null) {
             try {
                 hostname = normalizeDefaultHostname(InetAddress.getLocalHost().getHostName());
-                logger.info("Hostname: {} (via InetAddress.getLocalHost())", hostname);
+                logger.info("Hostname: {} (from InetAddress.getLocalHost())", hostname);
             } catch (Exception e) {
                 hostname = "localhost";
                 logger.warn("Failed to get the hostname using InetAddress.getLocalHost(); " +
@@ -119,7 +124,9 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
     private final String defaultHostname;
     private final String hostnamePattern;
     private final List<ServiceConfig> services = new ArrayList<>();
+    @Nullable
     private SslContext sslContext;
+    @Nullable
     private Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> decorator;
 
     /**
@@ -162,17 +169,91 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
     }
 
     /**
-     * Sets the {@link SslContext} of this {@link VirtualHost}.
+     * Configures SSL or TLS of this {@link VirtualHost} with the specified {@link SslContext}.
      */
-    public B sslContext(SslContext sslContext) {
+    public B tls(SslContext sslContext) {
         this.sslContext = VirtualHost.validateSslContext(requireNonNull(sslContext, "sslContext"));
         return self();
     }
 
     /**
+     * Configures SSL or TLS of this {@link VirtualHost} with the specified {@code keyCertChainFile}
+     * and cleartext {@code keyFile}.
+     */
+    public B tls(File keyCertChainFile, File keyFile) throws SSLException {
+        tls(keyCertChainFile, keyFile, null);
+        return self();
+    }
+
+    /**
+     * Configures SSL or TLS of this {@link VirtualHost} with the specified {@code keyCertChainFile},
+     * {@code keyFile} and {@code keyPassword}.
+     */
+    public B tls(File keyCertChainFile, File keyFile, @Nullable String keyPassword) throws SSLException {
+        if (!keyCertChainFile.exists()) {
+            throw new SSLException("non-existent certificate chain file: " + keyCertChainFile);
+        }
+        if (!keyCertChainFile.canRead()) {
+            throw new SSLException("cannot read certificate chain file: " + keyCertChainFile);
+        }
+        if (!keyFile.exists()) {
+            throw new SSLException("non-existent key file: " + keyFile);
+        }
+        if (!keyFile.canRead()) {
+            throw new SSLException("cannot read key file: " + keyFile);
+        }
+
+        final SslContext sslCtx;
+
+        try {
+            sslCtx = BouncyCastleKeyFactoryProvider.call(() -> {
+                final SslContextBuilder builder =
+                        SslContextBuilder.forServer(keyCertChainFile, keyFile, keyPassword);
+
+                builder.sslProvider(Flags.useOpenSsl() ? SslProvider.OPENSSL : SslProvider.JDK);
+                builder.ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE);
+                builder.applicationProtocolConfig(HTTPS_ALPN_CFG);
+
+                return builder.build();
+            });
+        } catch (RuntimeException | SSLException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new SSLException("failed to configure TLS: " + e, e);
+        }
+
+        tls(sslCtx);
+        return self();
+    }
+
+    /**
+     * Configures SSL or TLS of this {@link VirtualHost} with an auto-generated self-signed certificate.
+     * <strong>Note:</strong> You should never use this in production but only for a testing purpose.
+     *
+     * @throws CertificateException if failed to generate a self-signed certificate
+     */
+    public B tlsSelfSigned() throws SSLException, CertificateException {
+        final SelfSignedCertificate ssc = new SelfSignedCertificate(defaultHostname);
+        return tls(ssc.certificate(), ssc.privateKey());
+    }
+
+    /**
+     * Sets the {@link SslContext} of this {@link VirtualHost}.
+     *
+     * @deprecated Use {@link #tls(SslContext)}.
+     */
+    @Deprecated
+    public B sslContext(SslContext sslContext) {
+        return tls(sslContext);
+    }
+
+    /**
      * Sets the {@link SslContext} of this {@link VirtualHost} from the specified {@link SessionProtocol},
      * {@code keyCertChainFile} and cleartext {@code keyFile}.
+     *
+     * @deprecated Use {@link #tls(File, File)}.
      */
+    @Deprecated
     public B sslContext(
             SessionProtocol protocol, File keyCertChainFile, File keyFile) throws SSLException {
         sslContext(protocol, keyCertChainFile, keyFile, null);
@@ -182,23 +263,19 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
     /**
      * Sets the {@link SslContext} of this {@link VirtualHost} from the specified {@link SessionProtocol},
      * {@code keyCertChainFile}, {@code keyFile} and {@code keyPassword}.
+     *
+     * @deprecated Use {@link #tls(File, File, String)}.
      */
+    @Deprecated
     public B sslContext(
             SessionProtocol protocol,
-            File keyCertChainFile, File keyFile, String keyPassword) throws SSLException {
+            File keyCertChainFile, File keyFile, @Nullable String keyPassword) throws SSLException {
 
         if (requireNonNull(protocol, "protocol") != SessionProtocol.HTTPS) {
             throw new IllegalArgumentException("unsupported protocol: " + protocol);
         }
 
-        final SslContextBuilder builder = SslContextBuilder.forServer(keyCertChainFile, keyFile, keyPassword);
-
-        builder.sslProvider(Flags.useOpenSsl() ? SslProvider.OPENSSL : SslProvider.JDK);
-        builder.ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE);
-        builder.applicationProtocolConfig(HTTPS_ALPN_CFG);
-
-        sslContext(builder.build());
-        return self();
+        return tls(keyCertChainFile, keyFile, keyPassword);
     }
 
     /**
@@ -271,7 +348,7 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
      */
     public <T extends ServiceWithPathMappings<HttpRequest, HttpResponse>,
             R extends Service<HttpRequest, HttpResponse>>
-    B service(T serviceWithPathMappings, Function<T, R> decorator) {
+    B service(T serviceWithPathMappings, Function<? super T, R> decorator) {
         requireNonNull(serviceWithPathMappings, "serviceWithPathMappings");
         requireNonNull(serviceWithPathMappings.pathMappings(), "serviceWithPathMappings.pathMappings()");
         requireNonNull(decorator, "decorator");
@@ -296,7 +373,8 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
      */
     public B annotatedService(Object service, Object... exceptionHandlersAndConverters) {
         return annotatedService("/", service, Function.identity(),
-                                ImmutableList.copyOf(exceptionHandlersAndConverters));
+                                ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
+                                                                    "exceptionHandlersAndConverters")));
     }
 
     /**
@@ -310,7 +388,9 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
                               Function<Service<HttpRequest, HttpResponse>,
                                       ? extends Service<HttpRequest, HttpResponse>> decorator,
                               Object... exceptionHandlersAndConverters) {
-        return annotatedService("/", service, decorator, exceptionHandlersAndConverters);
+        return annotatedService("/", service, decorator,
+                                requireNonNull(exceptionHandlersAndConverters,
+                                               "exceptionHandlersAndConverters"));
     }
 
     /**
@@ -330,7 +410,8 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
     public B annotatedService(String pathPrefix, Object service,
                               Object... exceptionHandlersAndConverters) {
         return annotatedService(pathPrefix, service, Function.identity(),
-                                ImmutableList.copyOf(exceptionHandlersAndConverters));
+                                ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
+                                                                    "exceptionHandlersAndConverters")));
     }
 
     /**
@@ -345,7 +426,8 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
                                       ? extends Service<HttpRequest, HttpResponse>> decorator,
                               Object... exceptionHandlersAndConverters) {
         return annotatedService(pathPrefix, service, decorator,
-                                ImmutableList.copyOf(exceptionHandlersAndConverters));
+                                ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
+                                                                    "exceptionHandlersAndConverters")));
     }
 
     /**
@@ -365,9 +447,9 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
         requireNonNull(decorator, "decorator");
         requireNonNull(exceptionHandlersAndConverters, "exceptionHandlersAndConverters");
 
-        final List<AnnotatedHttpService> entries =
-                AnnotatedHttpServices.build(pathPrefix, service, exceptionHandlersAndConverters);
-        entries.forEach(e -> service(e.pathMapping(), decorator.apply(e.decorator().apply(e))));
+        final List<AnnotatedHttpServiceElement> elements =
+                AnnotatedHttpServiceFactory.find(pathPrefix, service, exceptionHandlersAndConverters);
+        elements.forEach(e -> service(e.pathMapping(), decorator.apply(e.decorator().apply(e.service()))));
         return self();
     }
 

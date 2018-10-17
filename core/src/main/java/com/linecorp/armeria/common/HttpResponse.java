@@ -35,6 +35,8 @@ import com.linecorp.armeria.common.FixedHttpResponse.TwoElementFixedHttpResponse
 import com.linecorp.armeria.common.stream.StreamMessage;
 import com.linecorp.armeria.common.util.Exceptions;
 
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.EventExecutor;
 
 /**
@@ -88,7 +90,7 @@ public interface HttpResponse extends Response, StreamMessage<HttpObject> {
     static HttpResponse of(HttpStatus status) {
         requireNonNull(status, "status");
         if (status.codeClass() == HttpStatusClass.INFORMATIONAL) {
-            HttpResponseWriter res = streaming();
+            final HttpResponseWriter res = streaming();
             res.write(HttpHeaders.of(status));
             return res;
         } else if (isContentAlwaysEmpty(status)) {
@@ -106,6 +108,50 @@ public interface HttpResponse extends Response, StreamMessage<HttpObject> {
      */
     static HttpResponse of(HttpStatus status, MediaType mediaType, String content) {
         return of(status, mediaType, content.getBytes(mediaType.charset().orElse(StandardCharsets.UTF_8)));
+    }
+
+    /**
+     * Creates a new HTTP response of OK status with the content as UTF_8 and closes the stream.
+     *
+     * @param content the content of the response
+     */
+    static HttpResponse of(String content) {
+        return of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, content);
+    }
+
+    /**
+     * Creates a new HTTP response of OK status with the content as UTF_8 and closes the stream.
+     * The content of the response is formatted by {@link String#format(Locale, String, Object...)} with
+     * {@linkplain Locale#ENGLISH English locale}.
+     *
+     * @param format {@linkplain Formatter the format string} of the response content
+     * @param args the arguments referenced by the format specifiers in the format string
+     */
+    static HttpResponse of(String format, Object... args) {
+        return of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, format, args);
+    }
+
+    /**
+     * Creates a new HTTP response of OK status with the content and closes the stream.
+     *
+     * @param mediaType the {@link MediaType} of the response content
+     * @param content the content of the response
+     */
+    static HttpResponse of(MediaType mediaType, String content) {
+        return of(HttpStatus.OK, mediaType, content);
+    }
+
+    /**
+     * Creates a new HTTP response of OK status with the content and closes the stream.
+     * The content of the response is formatted by {@link String#format(Locale, String, Object...)} with
+     * {@linkplain Locale#ENGLISH English locale}.
+     *
+     * @param mediaType the {@link MediaType} of the response content
+     * @param format {@linkplain Formatter the format string} of the response content
+     * @param args the arguments referenced by the format specifiers in the format string
+     */
+    static HttpResponse of(MediaType mediaType, String format, Object... args) {
+        return of(HttpStatus.OK, mediaType, format, args);
     }
 
     /**
@@ -209,6 +255,7 @@ public interface HttpResponse extends Response, StreamMessage<HttpObject> {
         }
 
         if (isContentAlwaysEmptyWithValidation(status, content, trailingHeaders)) {
+            ReferenceCountUtil.safeRelease(content);
             return new OneElementFixedHttpResponse(headers);
         } else if (!content.isEmpty()) {
             if (trailingHeaders.isEmpty()) {
@@ -310,7 +357,7 @@ public interface HttpResponse extends Response, StreamMessage<HttpObject> {
      */
     default CompletableFuture<AggregatedHttpMessage> aggregate() {
         final CompletableFuture<AggregatedHttpMessage> future = new CompletableFuture<>();
-        final HttpResponseAggregator aggregator = new HttpResponseAggregator(future);
+        final HttpResponseAggregator aggregator = new HttpResponseAggregator(future, null);
         completionFuture().whenComplete(aggregator);
         subscribe(aggregator);
         return future;
@@ -322,9 +369,41 @@ public interface HttpResponse extends Response, StreamMessage<HttpObject> {
      */
     default CompletableFuture<AggregatedHttpMessage> aggregate(EventExecutor executor) {
         final CompletableFuture<AggregatedHttpMessage> future = new CompletableFuture<>();
-        final HttpResponseAggregator aggregator = new HttpResponseAggregator(future);
+        final HttpResponseAggregator aggregator = new HttpResponseAggregator(future, null);
         completionFuture().whenCompleteAsync(aggregator, executor);
         subscribe(aggregator, executor);
+        return future;
+    }
+
+    /**
+     * Aggregates this response. The returned {@link CompletableFuture} will be notified when the content and
+     * the trailing headers of the response are received fully. {@link AggregatedHttpMessage#content()} will
+     * return a pooled object, and the caller must ensure to release it. If you don't know what this means,
+     * use {@link HttpResponse#aggregate()}.
+     */
+    default CompletableFuture<AggregatedHttpMessage> aggregateWithPooledObjects(ByteBufAllocator alloc) {
+        requireNonNull(alloc, "alloc");
+        final CompletableFuture<AggregatedHttpMessage> future = new CompletableFuture<>();
+        final HttpResponseAggregator aggregator = new HttpResponseAggregator(future, alloc);
+        completionFuture().whenComplete(aggregator);
+        subscribe(aggregator, true);
+        return future;
+    }
+
+    /**
+     * Aggregates this response. The returned {@link CompletableFuture} will be notified when the content and
+     * the trailing headers of the request is received fully. {@link AggregatedHttpMessage#content()} will
+     * return a pooled object, and the caller must ensure to release it. If you don't know what this means,
+     * use {@link HttpResponse#aggregate()}.
+     */
+    default CompletableFuture<AggregatedHttpMessage> aggregateWithPooledObjects(
+            EventExecutor executor, ByteBufAllocator alloc) {
+        requireNonNull(executor, "executor");
+        requireNonNull(alloc, "alloc");
+        final CompletableFuture<AggregatedHttpMessage> future = new CompletableFuture<>();
+        final HttpResponseAggregator aggregator = new HttpResponseAggregator(future, alloc);
+        completionFuture().whenCompleteAsync(aggregator, executor);
+        subscribe(aggregator, executor, true);
         return future;
     }
 }

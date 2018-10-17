@@ -32,7 +32,7 @@ import com.linecorp.armeria.server.DecoratingServiceFunction;
  */
 @Repeatable(Decorators.class)
 @Retention(RetentionPolicy.RUNTIME)
-@Target(ElementType.METHOD)
+@Target({ ElementType.TYPE, ElementType.METHOD })
 public @interface Decorator {
 
     /**
@@ -40,4 +40,9 @@ public @interface Decorator {
      * default constructor.
      */
     Class<? extends DecoratingServiceFunction<HttpRequest, HttpResponse>> value();
+
+    /**
+     * The order of decoration, where a {@link Decorator} of lower value will be applied first.
+     */
+    int order() default 0;
 }

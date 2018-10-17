@@ -17,8 +17,7 @@
 package com.linecorp.armeria.it.client.endpoint;
 
 import static com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy.WEIGHTED_ROUND_ROBIN;
-import static org.hamcrest.core.Is.is;
-import static org.junit.Assert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.Rule;
 import org.junit.Test;
@@ -50,56 +49,60 @@ public class StaticEndpointGroupIntegrationTest {
         serverTwo.start();
         serverThree.start();
 
-        EndpointGroup endpointGroup = new StaticEndpointGroup(
-                Endpoint.of("127.0.0.1", serverOne.httpPort()),
-                Endpoint.of("127.0.0.1", serverTwo.httpPort()),
-                Endpoint.of("127.0.0.1", serverThree.httpPort()));
-        String groupName = name.getMethodName();
-        String endpointGroupMark = "group:";
+        final EndpointGroup endpointGroup = new StaticEndpointGroup(
+                Endpoint.of("127.0.0.1", serverOne.httpPort()).withWeight(1),
+                Endpoint.of("127.0.0.1", serverTwo.httpPort()).withWeight(2),
+                Endpoint.of("127.0.0.1", serverThree.httpPort()).withWeight(3));
+        final String groupName = name.getMethodName();
+        final String endpointGroupMark = "group:";
 
         EndpointGroupRegistry.register(groupName, endpointGroup, WEIGHTED_ROUND_ROBIN);
 
         HelloService.Iface ipService = Clients.newClient(
                 "ttext+http://" + endpointGroupMark + groupName + "/serverIp",
                 HelloService.Iface.class);
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverOne.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverThree.httpPort()));
+        assertThat(ipService.hello("ip")).isEqualTo(
+                "host:127.0.0.1:" + serverOne.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo(
+                "host:127.0.0.1:" + serverTwo.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverThree.httpPort());
 
-        StaticEndpointGroup serverGroup2 = new StaticEndpointGroup(
-                Endpoint.of("127.0.0.1", serverOne.httpPort(), 2),
-                Endpoint.of("127.0.0.1", serverTwo.httpPort(), 4),
-                Endpoint.of("127.0.0.1", serverThree.httpPort(), 2));
+        final StaticEndpointGroup serverGroup2 = new StaticEndpointGroup(
+                Endpoint.of("127.0.0.1", serverOne.httpPort()).withWeight(2),
+                Endpoint.of("127.0.0.1", serverTwo.httpPort()).withWeight(4),
+                Endpoint.of("127.0.0.1", serverThree.httpPort()).withWeight(3));
 
         EndpointGroupRegistry.register(groupName, serverGroup2, WEIGHTED_ROUND_ROBIN);
 
         ipService = Clients.newClient("tbinary+http://" + endpointGroupMark + groupName + "/serverIp",
                                       HelloService.Iface.class);
 
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverOne.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverThree.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverOne.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverThree.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverOne.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverThree.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverTwo.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverOne.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverThree.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverTwo.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverThree.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverTwo.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverTwo.httpPort());
 
         //new round
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverOne.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverThree.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverOne.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverThree.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverTwo.httpPort()));
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverOne.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverThree.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverTwo.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverOne.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverThree.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverTwo.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverThree.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverTwo.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverTwo.httpPort());
 
         //direct connect to ip host
         ipService = Clients.newClient("tbinary+http://127.0.0.1:" + serverOne.httpPort() + "/serverIp",
                                       HelloService.Iface.class);
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverOne.httpPort()));
-        assertThat(ipService.hello("ip"), is("host:127.0.0.1:" + serverOne.httpPort()));
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverOne.httpPort());
+        assertThat(ipService.hello("ip")).isEqualTo("host:127.0.0.1:" + serverOne.httpPort());
     }
 
     private static class IpServerRule extends ServerRule {

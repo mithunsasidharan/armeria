@@ -16,16 +16,17 @@
 
 package com.linecorp.armeria.server.tracing;
 
+import static com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext.ensureScopeUsesRequestContext;
+
 import java.util.function.Function;
 
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
+import com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext;
 import com.linecorp.armeria.internal.tracing.AsciiStringKeyFactory;
 import com.linecorp.armeria.internal.tracing.SpanContextUtil;
-import com.linecorp.armeria.internal.tracing.SpanTags;
 import com.linecorp.armeria.server.Service;
 import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.SimpleDecoratingService;
@@ -37,7 +38,6 @@ import brave.Tracer.SpanInScope;
 import brave.Tracing;
 import brave.propagation.TraceContext;
 import brave.propagation.TraceContextOrSamplingFlags;
-import io.netty.util.concurrent.FastThreadLocal;
 
 /**
  * Decorates a {@link Service} to trace inbound {@link HttpRequest}s using
@@ -48,13 +48,12 @@ import io.netty.util.concurrent.FastThreadLocal;
  */
 public class HttpTracingService extends SimpleDecoratingService<HttpRequest, HttpResponse> {
 
-    private static final FastThreadLocal<SpanInScope> SPAN_IN_THREAD = new FastThreadLocal<>();
-
     /**
      * Creates a new tracing {@link Service} decorator using the specified {@link Tracing} instance.
      */
     public static Function<Service<HttpRequest, HttpResponse>, HttpTracingService>
     newDecorator(Tracing tracing) {
+        ensureScopeUsesRequestContext(tracing);
         return service -> new HttpTracingService(service, tracing);
     }
 
@@ -73,9 +72,9 @@ public class HttpTracingService extends SimpleDecoratingService<HttpRequest, Htt
 
     @Override
     public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-        TraceContextOrSamplingFlags contextOrFlags = extractor.extract(req.headers());
-        Span span = contextOrFlags.context() != null ? tracer.joinSpan(contextOrFlags.context())
-                                                     : tracer.newTrace(contextOrFlags.samplingFlags());
+        final TraceContextOrSamplingFlags contextOrFlags = extractor.extract(req.headers());
+        final Span span = contextOrFlags.context() != null ? tracer.joinSpan(contextOrFlags.context())
+                                                           : tracer.nextSpan(contextOrFlags);
         // For no-op spans, nothing special to do.
         if (span.isNoop()) {
             return delegate().serve(ctx, req);
@@ -84,17 +83,13 @@ public class HttpTracingService extends SimpleDecoratingService<HttpRequest, Htt
         final String method = ctx.method().name();
         span.kind(Kind.SERVER).name(method).start();
 
-        SpanContextUtil.setupContext(SPAN_IN_THREAD, ctx, span, tracer);
+        // Ensure the trace context propagates to children
+        ctx.onChild(RequestContextCurrentTraceContext::copy);
 
-        ctx.log().addListener(log -> closeSpan(span, log), RequestLogAvailability.COMPLETE);
+        ctx.log().addListener(log -> SpanContextUtil.closeSpan(span, log), RequestLogAvailability.COMPLETE);
 
         try (SpanInScope ignored = tracer.withSpanInScope(span)) {
             return delegate().serve(ctx, req);
         }
-    }
-
-    private void closeSpan(Span span, RequestLog log) {
-        SpanTags.addTags(span, log);
-        span.finish();
     }
 }

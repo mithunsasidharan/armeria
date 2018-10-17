@@ -16,8 +16,6 @@
 
 package com.linecorp.armeria.core;
 
-import static com.linecorp.armeria.common.SessionProtocol.HTTP;
-
 import java.time.Duration;
 
 import org.openjdk.jmh.annotations.Benchmark;
@@ -67,17 +65,16 @@ public class HttpServerBenchmark {
     @Setup
     public void startServer() throws Exception {
         server = new ServerBuilder()
-                .port(0, HTTP)
-                .service("/empty", ((ctx, req) -> HttpResponse.of(HttpStatus.OK)))
+                .service("/empty", (ctx, req) -> HttpResponse.of(HttpStatus.OK))
                 .defaultRequestTimeout(Duration.ZERO)
                 .meterRegistry(NoopMeterRegistry.get())
                 .build();
         server.start().join();
-        ServerPort httpPort = server.activePorts().values().stream()
-                                    .filter(p1 -> p1.protocol() == HTTP).findAny()
-                                    .get();
+        final ServerPort httpPort = server.activePorts().values().stream()
+                                          .filter(ServerPort::hasHttp).findAny()
+                                          .get();
         httpClient = Clients.newClient("none+" + protocol.uriText() + "://127.0.0.1:" +
-                                       httpPort.localAddress().getPort() + "/",
+                                       httpPort.localAddress().getPort() + '/',
                                        HttpClient.class);
     }
 

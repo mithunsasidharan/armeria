@@ -35,12 +35,10 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.SerializationFormat;
 import com.linecorp.armeria.common.util.SafeCloseable;
 import com.linecorp.armeria.internal.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.internal.grpc.GrpcJsonUtil;
-import com.linecorp.armeria.internal.grpc.GrpcLogUtil;
 import com.linecorp.armeria.internal.grpc.TimeoutHeaderUtil;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.PathMapping;
@@ -91,6 +89,7 @@ public final class GrpcService extends AbstractHttpService
     private final MessageMarshaller jsonMarshaller;
     private final int maxOutboundMessageSizeBytes;
     private final boolean unsafeWrapRequestBuffers;
+    private final String advertisedEncodingsHeader;
 
     private int maxInboundMessageSizeBytes;
 
@@ -111,12 +110,14 @@ public final class GrpcService extends AbstractHttpService
         this.maxOutboundMessageSizeBytes = maxOutboundMessageSizeBytes;
         this.unsafeWrapRequestBuffers = unsafeWrapRequestBuffers;
         this.maxInboundMessageSizeBytes = maxInboundMessageSizeBytes;
+
+        advertisedEncodingsHeader = String.join(",", decompressorRegistry.getAdvertisedMessageEncodings());
     }
 
     @Override
     protected HttpResponse doPost(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-        MediaType contentType = req.headers().contentType();
-        SerializationFormat serializationFormat = findSerializationFormat(contentType);
+        final MediaType contentType = req.headers().contentType();
+        final SerializationFormat serializationFormat = findSerializationFormat(contentType);
         if (serializationFormat == null) {
             return HttpResponse.of(HttpStatus.UNSUPPORTED_MEDIA_TYPE,
                                    MediaType.PLAIN_TEXT_UTF_8,
@@ -125,14 +126,14 @@ public final class GrpcService extends AbstractHttpService
 
         ctx.logBuilder().serializationFormat(serializationFormat);
 
-        String methodName = GrpcRequestUtil.determineMethod(ctx);
+        final String methodName = GrpcRequestUtil.determineMethod(ctx);
         if (methodName == null) {
             return HttpResponse.of(HttpStatus.BAD_REQUEST,
                                    MediaType.PLAIN_TEXT_UTF_8,
                                    "Invalid path.");
         }
 
-        ServerMethodDefinition<?, ?> method = registry.lookupMethod(methodName);
+        final ServerMethodDefinition<?, ?> method = registry.lookupMethod(methodName);
         if (method == null) {
             return HttpResponse.of(
                     ArmeriaServerCall.statusToTrailers(
@@ -140,26 +141,26 @@ public final class GrpcService extends AbstractHttpService
                             false));
         }
 
-        ctx.logBuilder().requestContent(GrpcLogUtil.rpcRequest(method.getMethodDescriptor()), null);
-
-        String timeoutHeader = req.headers().get(GrpcHeaderNames.GRPC_TIMEOUT);
+        final String timeoutHeader = req.headers().get(GrpcHeaderNames.GRPC_TIMEOUT);
         if (timeoutHeader != null) {
             try {
-                long timeout = TimeoutHeaderUtil.fromHeaderValue(timeoutHeader);
+                final long timeout = TimeoutHeaderUtil.fromHeaderValue(timeoutHeader);
                 ctx.setRequestTimeout(Duration.ofNanos(timeout));
             } catch (IllegalArgumentException e) {
                 return HttpResponse.of(ArmeriaServerCall.statusToTrailers(Status.fromThrowable(e), false));
             }
         }
 
-        HttpResponseWriter res = HttpResponse.streaming();
-        ArmeriaServerCall<?, ?> call = startCall(
+        ctx.logBuilder().deferRequestContent();
+        ctx.logBuilder().deferResponseContent();
+
+        final HttpResponseWriter res = HttpResponse.streaming();
+        final ArmeriaServerCall<?, ?> call = startCall(
                 methodName, method, ctx, req.headers(), res, serializationFormat);
         if (call != null) {
-            ctx.setRequestTimeoutHandler(() -> {
-                call.close(Status.DEADLINE_EXCEEDED, EMPTY_METADATA);
-            });
+            ctx.setRequestTimeoutHandler(() -> call.close(Status.DEADLINE_EXCEEDED, EMPTY_METADATA));
             req.subscribe(call.messageReader(), ctx.eventLoop(), true);
+            req.completionFuture().whenCompleteAsync(call.messageReader(), ctx.eventLoop());
         }
         return res;
     }
@@ -172,7 +173,7 @@ public final class GrpcService extends AbstractHttpService
             HttpHeaders headers,
             HttpResponseWriter res,
             SerializationFormat serializationFormat) {
-        ArmeriaServerCall<I, O> call = new ArmeriaServerCall<>(
+        final ArmeriaServerCall<I, O> call = new ArmeriaServerCall<>(
                 headers,
                 methodDef.getMethodDescriptor(),
                 compressorRegistry,
@@ -183,9 +184,10 @@ public final class GrpcService extends AbstractHttpService
                 ctx,
                 serializationFormat,
                 jsonMarshaller,
-                unsafeWrapRequestBuffers);
+                unsafeWrapRequestBuffers,
+                advertisedEncodingsHeader);
         final ServerCall.Listener<I> listener;
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+        try (SafeCloseable ignored = ctx.push()) {
             listener = methodDef.getServerCallHandler().startCall(call, EMPTY_METADATA);
         } catch (Throwable t) {
             call.setListener(new EmptyListener<>());
@@ -242,7 +244,7 @@ public final class GrpcService extends AbstractHttpService
     }
 
     private static MessageMarshaller jsonMarshaller(HandlerRegistry registry) {
-        List<MethodDescriptor<?, ?>> methods =
+        final List<MethodDescriptor<?, ?>> methods =
                 registry.services().stream()
                         .flatMap(service -> service.getMethods().stream())
                         .map(ServerMethodDefinition::getMethodDescriptor)

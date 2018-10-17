@@ -16,9 +16,11 @@
 
 package com.linecorp.armeria.server;
 
+import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
+
+import javax.annotation.Nullable;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
@@ -26,17 +28,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.linecorp.armeria.common.AggregatedHttpMessage;
+import com.linecorp.armeria.common.DefaultHttpHeaders;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.HttpStatusClass;
-import com.linecorp.armeria.common.logging.RequestLog;
+import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
+import com.linecorp.armeria.common.stream.AbortedStreamException;
+import com.linecorp.armeria.internal.Http1ObjectEncoder;
 import com.linecorp.armeria.internal.HttpObjectEncoder;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 
-import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http2.Http2Error;
@@ -61,17 +66,19 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
     private final HttpObjectEncoder responseEncoder;
     private final DecodedHttpRequest req;
     private final DefaultServiceRequestContext reqCtx;
-    private final Consumer<RequestLog> accessLogWriter;
+    private final AccessLogWriter accessLogWriter;
     private final long startTimeNanos;
 
+    @Nullable
     private Subscription subscription;
+    @Nullable
     private ScheduledFuture<?> timeoutFuture;
     private State state = State.NEEDS_HEADERS;
     private boolean isComplete;
 
     HttpResponseSubscriber(ChannelHandlerContext ctx, HttpObjectEncoder responseEncoder,
                            DefaultServiceRequestContext reqCtx, DecodedHttpRequest req,
-                           Consumer<RequestLog> accessLogWriter) {
+                           AccessLogWriter accessLogWriter) {
         this.ctx = ctx;
         this.responseEncoder = responseEncoder;
         this.req = req;
@@ -111,7 +118,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
     private void onTimeout() {
         if (state != State.DONE) {
             reqCtx.setTimedOut();
-            Runnable requestTimeoutHandler = reqCtx.requestTimeoutHandler();
+            final Runnable requestTimeoutHandler = reqCtx.requestTimeoutHandler();
             if (requestTimeoutHandler != null) {
                 requestTimeoutHandler.run();
             } else {
@@ -151,7 +158,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                             " (service: " + service() + ')');
                 }
 
-                final HttpHeaders headers = (HttpHeaders) o;
+                HttpHeaders headers = (HttpHeaders) o;
                 final HttpStatus status = headers.status();
                 if (status == null) {
                     throw newIllegalStateException("published an HttpHeaders without status: " + o +
@@ -163,7 +170,18 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                     break;
                 }
 
-                final int statusCode = status.code();
+                final HttpHeaders additionalHeaders = reqCtx.additionalResponseHeaders();
+                if (!additionalHeaders.isEmpty()) {
+                    if (headers.isImmutable()) {
+                        // All headers are already validated.
+                        final HttpHeaders temp = headers;
+                        headers = new DefaultHttpHeaders(false, temp.size() + additionalHeaders.size());
+                        headers.set(temp);
+                        o = headers;
+                    }
+                    headers.setAllIfAbsent(additionalHeaders);
+                }
+
                 logBuilder().responseHeaders(headers);
 
                 if (req.method() == HttpMethod.HEAD) {
@@ -173,6 +191,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                     break;
                 }
 
+                final int statusCode = status.code();
                 switch (statusCode) {
                     case 204:
                     case 205:
@@ -205,7 +224,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                 return;
         }
 
-        write(o, endOfStream, true);
+        write(o, endOfStream);
     }
 
     @Override
@@ -228,6 +247,11 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
             failAndRespond(cause,
                            AggregatedHttpMessage.of(((HttpStatusException) cause).httpStatus()),
                            Http2Error.CANCEL);
+        } else if (cause instanceof AbortedStreamException) {
+            // One of the two cases:
+            // - Client closed the connection too early.
+            // - Response publisher aborted the stream.
+            failAndReset((AbortedStreamException) cause);
         } else {
             logger.warn("{} Unexpected exception from a service or a response publisher: {}",
                         ctx.channel(), service(), cause);
@@ -245,45 +269,61 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
 
         if (wroteNothing(state)) {
             logger.warn("{} Published nothing (or only informational responses): {}", ctx.channel(), service());
-            responseEncoder.writeReset(ctx, req.id(), req.streamId(), Http2Error.INTERNAL_ERROR);
+            responseEncoder.writeReset(req.id(), req.streamId(), Http2Error.INTERNAL_ERROR);
             return;
         }
 
         if (state != State.DONE) {
-            write(HttpData.EMPTY_DATA, true, true);
+            write(HttpData.EMPTY_DATA, true);
         }
     }
 
-    private void write(HttpObject o, boolean endOfStream, boolean flush) {
-        final Channel ch = ctx.channel();
+    private void write(HttpObject o, boolean endOfStream) {
         if (endOfStream) {
             setDone();
         }
 
-        ch.eventLoop().execute(() -> write0(o, endOfStream, flush));
+        ctx.channel().eventLoop().execute(() -> write0(o, endOfStream));
     }
 
-    private void write0(HttpObject o, boolean endOfStream, boolean flush) {
+    private void write0(HttpObject o, boolean endOfStream) {
         final ChannelFuture future;
+        final boolean wroteEmptyData;
         if (o instanceof HttpData) {
             final HttpData data = (HttpData) o;
-            future = responseEncoder.writeData(ctx, req.id(), req.streamId(), data, endOfStream);
+            wroteEmptyData = data.isEmpty();
+            future = responseEncoder.writeData(req.id(), req.streamId(), data, endOfStream);
             logBuilder().increaseResponseLength(data.length());
         } else if (o instanceof HttpHeaders) {
-            future = responseEncoder.writeHeaders(ctx, req.id(), req.streamId(), (HttpHeaders) o, endOfStream);
+            wroteEmptyData = false;
+            future = responseEncoder.writeHeaders(req.id(), req.streamId(), (HttpHeaders) o, endOfStream);
         } else {
             // Should never reach here because we did validation in onNext().
             throw new Error();
         }
 
         future.addListener((ChannelFuture f) -> {
+            final boolean isSuccess;
+            if (f.isSuccess()) {
+                isSuccess = true;
+            } else {
+                // If 1) the last chunk we attempted to send was empty,
+                //    2) the connection has been closed,
+                //    3) and the protocol is HTTP/1,
+                // it is very likely that a client closed the connection after receiving the complete content,
+                // which is not really a problem.
+                isSuccess = endOfStream && wroteEmptyData &&
+                            f.cause() instanceof ClosedChannelException &&
+                            responseEncoder instanceof Http1ObjectEncoder;
+            }
+
             // Write an access log if:
             // - every message has been sent successfully.
             // - any write operation is failed with a cause.
-            if (f.isSuccess()) {
+            if (isSuccess) {
                 if (endOfStream && tryComplete()) {
                     logBuilder().endResponse();
-                    accessLogWriter.accept(reqCtx.log());
+                    reqCtx.log().addListener(accessLogWriter::log, RequestLogAvailability.COMPLETE);
                 }
                 if (state != State.DONE) {
                     subscription.request(1);
@@ -295,23 +335,19 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                 setDone();
                 logBuilder().endResponse(f.cause());
                 subscription.cancel();
-                accessLogWriter.accept(reqCtx.log());
+                reqCtx.log().addListener(accessLogWriter::log, RequestLogAvailability.COMPLETE);
             }
             HttpServerHandler.CLOSE_ON_FAILURE.operationComplete(f);
         });
 
-        if (flush) {
-            ctx.flush();
-        }
-
-        if (state == State.DONE) {
-            subscription.cancel();
-        }
+        ctx.flush();
     }
 
-    private void setDone() {
+    private State setDone() {
         cancelTimeout();
+        final State oldState = state;
         state = State.DONE;
+        return oldState;
     }
 
     private void failAndRespond(Throwable cause, AggregatedHttpMessage message, Http2Error error) {
@@ -321,33 +357,46 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
         logBuilder().responseHeaders(headers);
         logBuilder().increaseResponseLength(content.length());
 
-        final State state = this.state; // Keep the state before calling fail() because it updates state.
-        setDone();
+        final State oldState = setDone();
         subscription.cancel();
 
         final int id = req.id();
         final int streamId = req.streamId();
 
         final ChannelFuture future;
-        if (wroteNothing(state)) {
+        if (wroteNothing(oldState)) {
             // Did not write anything yet; we can send an error response instead of resetting the stream.
             if (content.isEmpty()) {
-                future = responseEncoder.writeHeaders(ctx, id, streamId, headers, true);
+                future = responseEncoder.writeHeaders(id, streamId, headers, true);
             } else {
-                responseEncoder.writeHeaders(ctx, id, streamId, headers, false);
-                future = responseEncoder.writeData(ctx, id, streamId, content, true);
+                responseEncoder.writeHeaders(id, streamId, headers, false);
+                future = responseEncoder.writeData(id, streamId, content, true);
             }
         } else {
             // Wrote something already; we have to reset/cancel the stream.
-            future = responseEncoder.writeReset(ctx, id, streamId, error);
+            future = responseEncoder.writeReset(id, streamId, error);
         }
 
-        if (state != State.DONE) {
+        addCallbackAndFlush(cause, oldState, future);
+    }
+
+    private void failAndReset(AbortedStreamException cause) {
+        final State oldState = setDone();
+        subscription.cancel();
+
+        final ChannelFuture future =
+                responseEncoder.writeReset(req.id(), req.streamId(), Http2Error.CANCEL);
+
+        addCallbackAndFlush(cause, oldState, future);
+    }
+
+    private void addCallbackAndFlush(Throwable cause, State oldState, ChannelFuture future) {
+        if (oldState != State.DONE) {
             future.addListener(unused -> {
                 // Write an access log always with a cause. Respect the first specified cause.
                 if (tryComplete()) {
                     logBuilder().endResponse(cause);
-                    accessLogWriter.accept(reqCtx.log());
+                    reqCtx.log().addListener(accessLogWriter::log, RequestLogAvailability.COMPLETE);
                 }
             });
         }

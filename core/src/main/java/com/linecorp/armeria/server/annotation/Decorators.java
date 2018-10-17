@@ -25,7 +25,7 @@ import java.lang.annotation.Target;
  * The containing annotation type for {@link Decorator}.
  */
 @Retention(RetentionPolicy.RUNTIME)
-@Target(ElementType.METHOD)
+@Target({ ElementType.TYPE, ElementType.METHOD })
 public @interface Decorators {
     /**
      * An array of {@link Decorator}s.

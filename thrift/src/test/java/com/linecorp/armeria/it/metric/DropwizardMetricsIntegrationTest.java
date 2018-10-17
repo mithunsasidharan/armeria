@@ -18,9 +18,9 @@ package com.linecorp.armeria.it.metric;
 
 import static com.linecorp.armeria.common.thrift.ThriftSerializationFormats.BINARY;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.AfterClass;
@@ -41,7 +41,6 @@ import com.linecorp.armeria.client.ClientFactoryBuilder;
 import com.linecorp.armeria.client.metric.MetricCollectingClient;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
-import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.metric.DropwizardMeterRegistries;
 import com.linecorp.armeria.common.metric.MeterIdPrefixFunction;
 import com.linecorp.armeria.server.ServerBuilder;
@@ -57,8 +56,6 @@ public class DropwizardMetricsIntegrationTest {
     private static final DropwizardMeterRegistry registry = DropwizardMeterRegistries.newRegistry();
     private static final MetricRegistry dropwizardRegistry = registry.getDropwizardRegistry();
 
-    private static CountDownLatch latch;
-
     @ClassRule
     public static final ServerRule server = new ServerRule() {
         @Override
@@ -69,10 +66,6 @@ public class DropwizardMetricsIntegrationTest {
                     return "success";
                 }
                 throw new IllegalArgumentException("bad argument");
-            }).decorate((delegate, ctx, req) -> {
-                ctx.log().addListener(log -> latch.countDown(),
-                                      RequestLogAvailability.COMPLETE);
-                return delegate.serve(ctx, req);
             }).decorate(MetricCollectingService.newDecorator(
                     MeterIdPrefixFunction.ofDefault("armeria.server.HelloService"))));
         }
@@ -91,8 +84,6 @@ public class DropwizardMetricsIntegrationTest {
 
     @Test
     public void normal() throws Exception {
-        latch = new CountDownLatch(14);
-
         makeRequest("world");
         makeRequest("world");
         makeRequest("space");
@@ -101,28 +92,26 @@ public class DropwizardMetricsIntegrationTest {
         makeRequest("space");
         makeRequest("world");
 
-        // Wait until all RequestLogs are collected.
-        latch.await();
+        await().untilAsserted(() -> {
+            assertThat(dropwizardRegistry.getMeters()
+                                         .get(clientMetricNameWithStatusAndResult("requests", 200, "failure"))
+                                         .getCount()).isEqualTo(3L);
+            assertThat(dropwizardRegistry.getMeters()
+                                         .get(serverMetricNameWithStatusAndResult("requests", 200, "failure"))
+                                         .getCount()).isEqualTo(3L);
+            assertThat(dropwizardRegistry.getMeters()
+                                         .get(clientMetricNameWithStatusAndResult("requests", 200, "success"))
+                                         .getCount()).isEqualTo(4L);
+            assertThat(dropwizardRegistry.getMeters()
+                                         .get(serverMetricNameWithStatusAndResult("requests", 200, "success"))
+                                         .getCount()).isEqualTo(4L);
 
-        dropwizardRegistry.getMeters().keySet().forEach(System.out::println);
-        assertThat(dropwizardRegistry.getMeters()
-                                     .get(clientMetricName("requests") + ".result:failure")
-                                     .getCount()).isEqualTo(3L);
-        assertThat(dropwizardRegistry.getMeters()
-                                     .get(serverMetricName("requests") + ".result:failure")
-                                     .getCount()).isEqualTo(3L);
-        assertThat(dropwizardRegistry.getMeters()
-                                     .get(clientMetricName("requests") + ".result:success")
-                                     .getCount()).isEqualTo(4L);
-        assertThat(dropwizardRegistry.getMeters()
-                                     .get(serverMetricName("requests") + ".result:success")
-                                     .getCount()).isEqualTo(4L);
-
-        assertTimer("requestDuration", 7);
-        assertHistogram("requestLength", 7);
-        assertTimer("responseDuration", 7);
-        assertHistogram("responseLength", 7);
-        assertTimer("totalDuration", 7);
+            assertTimer("requestDuration", 7);
+            assertHistogram("requestLength", 7);
+            assertTimer("responseDuration", 7);
+            assertHistogram("responseLength", 7);
+            assertTimer("totalDuration", 7);
+        });
     }
 
     private static void assertHistogram(String property, int expectedCount) {
@@ -134,31 +123,46 @@ public class DropwizardMetricsIntegrationTest {
     }
 
     private static void assertSummary(Map<String, ?> map, String property, int expectedCount) {
-        assertThat(((Counting) map.get(clientMetricName(property))).getCount()).isEqualTo(expectedCount);
-        assertThat(((Sampling) map.get(clientMetricName(property))).getSnapshot().getMean()).isPositive();
-        assertThat(((Counting) map.get(serverMetricName(property))).getCount()).isEqualTo(expectedCount);
-        assertThat(((Sampling) map.get(serverMetricName(property))).getSnapshot().getMean()).isPositive();
+        assertThat(((Counting) map.get(clientMetricNameWithStatus(property, 200))).getCount())
+                .isEqualTo(expectedCount);
+        assertThat(((Sampling) map.get(clientMetricNameWithStatus(property, 200))).getSnapshot().getMean())
+                .isPositive();
+        assertThat(((Counting) map.get(serverMetricNameWithStatus(property, 200))).getCount())
+                .isEqualTo(expectedCount);
+        assertThat(((Sampling) map.get(serverMetricNameWithStatus(property, 200))).getSnapshot().getMean())
+                .isPositive();
     }
 
-    private static String serverMetricName(String property) {
+    private static String serverMetricName(String property, int status) {
         return MetricRegistry.name("armeria", "server", "HelloService", property,
-                                   "hostnamePattern:*", "method:hello", "pathMapping:exact:/helloservice");
+                                   "hostnamePattern:*", "httpStatus:" + status,
+                                   "method:hello", "pathMapping:exact:/helloservice");
     }
 
-    private static String clientMetricName(String property) {
+    private static String serverMetricNameWithStatus(String property, int status) {
+        return serverMetricName(property, status);
+    }
+
+    private static String serverMetricNameWithStatusAndResult(String property, int status, String result) {
+        return serverMetricName(property, status) + ".result:" + result;
+    }
+
+    private static String clientMetricName(String property, int status) {
         return MetricRegistry.name("armeria", "client", "HelloService", property,
-                                   "method:hello");
+                                   "httpStatus:" + status, "method:hello");
+    }
+
+    private static String clientMetricNameWithStatus(String prop, int status) {
+        return clientMetricName(prop, status);
+    }
+
+    private static String clientMetricNameWithStatusAndResult(String prop, int status, String result) {
+        return clientMetricName(prop, status) + ".result:" + result;
     }
 
     private static void makeRequest(String name) {
-        Iface client = new ClientBuilder(server.uri(BINARY, "/helloservice"))
+        final Iface client = new ClientBuilder(server.uri(BINARY, "/helloservice"))
                 .factory(clientFactory)
-                .decorator(RpcRequest.class, RpcResponse.class,
-                           (delegate, ctx, req) -> {
-                               ctx.log().addListener(unused -> latch.countDown(),
-                                                     RequestLogAvailability.COMPLETE);
-                               return delegate.execute(ctx, req);
-                           })
                 .decorator(RpcRequest.class, RpcResponse.class,
                            MetricCollectingClient.newDecorator(
                                    MeterIdPrefixFunction.ofDefault("armeria.client.HelloService")))

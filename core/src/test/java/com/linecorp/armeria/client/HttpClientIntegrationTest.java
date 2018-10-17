@@ -16,7 +16,6 @@
 
 package com.linecorp.armeria.client;
 
-import static com.linecorp.armeria.common.SessionProtocol.HTTP;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
@@ -38,12 +37,15 @@ import org.junit.Test;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
-import com.google.common.base.Throwables;
 import com.google.common.io.ByteStreams;
 import com.google.common.io.Closeables;
 
 import com.linecorp.armeria.client.encoding.DeflateStreamDecoderFactory;
 import com.linecorp.armeria.client.encoding.HttpDecodingClient;
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
+import com.linecorp.armeria.client.endpoint.EndpointGroupRegistry;
+import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
+import com.linecorp.armeria.client.endpoint.StaticEndpointGroup;
 import com.linecorp.armeria.common.AggregatedHttpMessage;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaderNames;
@@ -57,6 +59,7 @@ import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.util.CompletionActions;
+import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.ServerBuilder;
 import com.linecorp.armeria.server.Service;
@@ -86,8 +89,8 @@ public class HttpClientIntegrationTest {
 
         @Override
         public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-            HttpResponse res = delegate().serve(ctx, req);
-            HttpResponseWriter decorated = HttpResponse.streaming();
+            final HttpResponse res = delegate().serve(ctx, req);
+            final HttpResponseWriter decorated = HttpResponse.streaming();
             res.subscribe(new Subscriber<HttpObject>() {
                 @Override
                 public void onSubscribe(Subscription s) {
@@ -121,8 +124,8 @@ public class HttpClientIntegrationTest {
 
         @Override
         public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-            HttpResponse res = delegate().serve(ctx, req);
-            HttpResponseWriter decorated = HttpResponse.streaming();
+            final HttpResponse res = delegate().serve(ctx, req);
+            final HttpResponseWriter decorated = HttpResponse.streaming();
             res.subscribe(new Subscriber<HttpObject>() {
                 @Override
                 public void onSubscribe(Subscription s) {
@@ -161,7 +164,7 @@ public class HttpClientIntegrationTest {
         @Override
         protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req)
                 throws Exception {
-            ByteBuf buf = ctx.alloc().buffer();
+            final ByteBuf buf = ctx.alloc().buffer();
             buf.writeCharSequence("pooled content", StandardCharsets.UTF_8);
             releasedByteBuf.set(buf);
             return HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, new ByteBufHttpData(buf, false));
@@ -172,8 +175,6 @@ public class HttpClientIntegrationTest {
     public static final ServerRule server = new ServerRule() {
         @Override
         protected void configure(ServerBuilder sb) throws Exception {
-            sb.port(0, HTTP);
-
             sb.service("/httptestbody", new AbstractHttpService() {
 
                 @Override
@@ -205,7 +206,7 @@ public class HttpClientIntegrationTest {
                         if (cause != null) {
                             return HttpResponse.of(
                                     HttpStatus.INTERNAL_SERVER_ERROR,
-                                    MediaType.PLAIN_TEXT_UTF_8, Throwables.getStackTraceAsString(cause));
+                                    MediaType.PLAIN_TEXT_UTF_8, Exceptions.traceText(cause));
                         }
 
                         return HttpResponse.of(
@@ -229,7 +230,7 @@ public class HttpClientIntegrationTest {
             sb.service("/useragent", new AbstractHttpService() {
                 @Override
                 protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) {
-                    String ua = req.headers().get(HttpHeaderNames.USER_AGENT, "undefined");
+                    final String ua = req.headers().get(HttpHeaderNames.USER_AGENT, "undefined");
                     return HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, ua);
                 }
             });
@@ -237,7 +238,7 @@ public class HttpClientIntegrationTest {
             sb.service("/authority", new AbstractHttpService() {
                 @Override
                 protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) {
-                    String ua = req.headers().get(HttpHeaderNames.AUTHORITY, "undefined");
+                    final String ua = req.headers().get(HttpHeaderNames.AUTHORITY, "undefined");
                     return HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, ua);
                 }
             });
@@ -274,9 +275,9 @@ public class HttpClientIntegrationTest {
 
             sb.service("/pooled-unaware", new PooledContentService().decorate(PoolUnawareDecorator::new));
 
-            sb.service("/stream-closed", ((ctx, req) -> {
+            sb.service("/stream-closed", (ctx, req) -> {
                 ctx.setRequestTimeout(Duration.ZERO);
-                HttpResponseWriter res = HttpResponse.streaming();
+                final HttpResponseWriter res = HttpResponse.streaming();
                 res.write(HttpHeaders.of(HttpStatus.OK));
                 req.subscribe(new Subscriber<HttpObject>() {
                     @Override
@@ -298,7 +299,7 @@ public class HttpClientIntegrationTest {
                     }
                 }, ctx.eventLoop());
                 return res;
-            }));
+            });
         }
     };
 
@@ -324,9 +325,9 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void testRequestNoBody() throws Exception {
-        HttpClient client = HttpClient.of(server.uri("/"));
+        final HttpClient client = HttpClient.of(server.uri("/"));
 
-        AggregatedHttpMessage response = client.execute(
+        final AggregatedHttpMessage response = client.execute(
                 HttpHeaders.of(HttpMethod.GET, "/httptestbody")
                            .set(HttpHeaderNames.ACCEPT, "utf-8")).aggregate().get();
 
@@ -338,9 +339,9 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void testRequestWithBody() throws Exception {
-        HttpClient client = HttpClient.of(server.uri("/"));
+        final HttpClient client = HttpClient.of(server.uri("/"));
 
-        AggregatedHttpMessage response = client.execute(
+        final AggregatedHttpMessage response = client.execute(
                 HttpHeaders.of(HttpMethod.POST, "/httptestbody")
                            .set(HttpHeaderNames.ACCEPT, "utf-8"),
                 "requestbody日本語").aggregate().get();
@@ -352,10 +353,39 @@ public class HttpClientIntegrationTest {
     }
 
     @Test
-    public void testNot200() throws Exception {
-        HttpClient client = HttpClient.of(server.uri("/"));
+    public void testResolvedEndpointWithAlternateAuthority() throws Exception {
+        final EndpointGroup group = new StaticEndpointGroup(Endpoint.of("localhost", server.httpPort())
+                                                                    .withIpAddr("127.0.0.1"));
+        testEndpointWithAlternateAuthority(group);
+    }
 
-        AggregatedHttpMessage response = client.get("/not200").aggregate().get();
+    @Test
+    public void testUnresolvedEndpointWithAlternateAuthority() throws Exception {
+        final EndpointGroup group = new StaticEndpointGroup(Endpoint.of("localhost", server.httpPort()));
+        testEndpointWithAlternateAuthority(group);
+    }
+
+    private static void testEndpointWithAlternateAuthority(EndpointGroup group) {
+        final String groupName = "testEndpointWithAlternateAuthority";
+        EndpointGroupRegistry.register(groupName, group, EndpointSelectionStrategy.ROUND_ROBIN);
+        try {
+            final HttpClient client = new HttpClientBuilder("http://group:" + groupName)
+                    .setHttpHeader(HttpHeaderNames.AUTHORITY, "255.255.255.255.xip.io")
+                    .build();
+
+            final AggregatedHttpMessage res = client.get("/hello/world").aggregate().join();
+            assertThat(res.status()).isEqualTo(HttpStatus.OK);
+            assertThat(res.content().toStringUtf8()).isEqualTo("success");
+        } finally {
+            EndpointGroupRegistry.unregister(groupName);
+        }
+    }
+
+    @Test
+    public void testNot200() throws Exception {
+        final HttpClient client = HttpClient.of(server.uri("/"));
+
+        final AggregatedHttpMessage response = client.get("/not200").aggregate().get();
 
         assertEquals(HttpStatus.NOT_FOUND, response.headers().status());
     }
@@ -409,24 +439,24 @@ public class HttpClientIntegrationTest {
 
     private static void testHeaderOverridableByClientOption(String path, AsciiString headerName,
                                                             String headerValue) throws Exception {
-        HttpHeaders headers = HttpHeaders.of(headerName, headerValue);
-        ClientOptions options = ClientOptions.of(ClientOption.HTTP_HEADERS.newValue(headers));
-        HttpClient client = HttpClient.of(server.uri("/"), options);
+        final HttpHeaders headers = HttpHeaders.of(headerName, headerValue);
+        final ClientOptions options = ClientOptions.of(ClientOption.HTTP_HEADERS.newValue(headers));
+        final HttpClient client = HttpClient.of(server.uri("/"), options);
 
-        AggregatedHttpMessage response = client.get(path).aggregate().get();
+        final AggregatedHttpMessage response = client.get(path).aggregate().get();
 
         assertEquals(headerValue, response.content().toStringUtf8());
     }
 
     private static void testHeaderOverridableByRequestHeader(String path, AsciiString headerName,
                                                              String headerValue) throws Exception {
-        HttpHeaders headers = HttpHeaders.of(headerName, headerValue);
-        ClientOptions options = ClientOptions.of(ClientOption.HTTP_HEADERS.newValue(headers));
-        HttpClient client = HttpClient.of(server.uri("/"), options);
+        final HttpHeaders headers = HttpHeaders.of(headerName, headerValue);
+        final ClientOptions options = ClientOptions.of(ClientOption.HTTP_HEADERS.newValue(headers));
+        final HttpClient client = HttpClient.of(server.uri("/"), options);
 
         final String OVERRIDDEN_VALUE = "Overridden";
 
-        AggregatedHttpMessage response =
+        final AggregatedHttpMessage response =
                 client.execute(HttpHeaders.of(HttpMethod.GET, path)
                                           .add(headerName, OVERRIDDEN_VALUE))
                       .aggregate().get();
@@ -436,10 +466,10 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void httpDecoding() throws Exception {
-        HttpClient client = new HttpClientBuilder(server.uri("/"))
+        final HttpClient client = new HttpClientBuilder(server.uri("/"))
                 .factory(clientFactory).decorator(HttpDecodingClient.newDecorator()).build();
 
-        AggregatedHttpMessage response =
+        final AggregatedHttpMessage response =
                 client.execute(HttpHeaders.of(HttpMethod.GET, "/encoding")).aggregate().get();
         assertThat(response.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("gzip");
         assertThat(response.content().toStringUtf8()).isEqualTo(
@@ -448,11 +478,11 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void httpDecoding_deflate() throws Exception {
-        HttpClient client = new HttpClientBuilder(server.uri("/"))
+        final HttpClient client = new HttpClientBuilder(server.uri("/"))
                 .factory(clientFactory)
                 .decorator(HttpDecodingClient.newDecorator(new DeflateStreamDecoderFactory())).build();
 
-        AggregatedHttpMessage response =
+        final AggregatedHttpMessage response =
                 client.execute(HttpHeaders.of(HttpMethod.GET, "/encoding")).aggregate().get();
         assertThat(response.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("deflate");
         assertThat(response.content().toStringUtf8()).isEqualTo(
@@ -461,11 +491,11 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void httpDecoding_noEncodingApplied() throws Exception {
-        HttpClient client = new HttpClientBuilder(server.uri("/"))
+        final HttpClient client = new HttpClientBuilder(server.uri("/"))
                 .factory(clientFactory)
                 .decorator(HttpDecodingClient.newDecorator(new DeflateStreamDecoderFactory())).build();
 
-        AggregatedHttpMessage response =
+        final AggregatedHttpMessage response =
                 client.execute(HttpHeaders.of(HttpMethod.GET, "/encoding-toosmall")).aggregate().get();
         assertThat(response.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
         assertThat(response.content().toStringUtf8()).isEqualTo("small content");
@@ -504,27 +534,27 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void givenHttpClientUriPathAndRequestPath_whenGet_thenRequestToConcatenatedPath() throws Exception {
-        HttpClient client = HttpClient.of(server.uri("/hello"));
+        final HttpClient client = HttpClient.of(server.uri("/hello"));
 
-        AggregatedHttpMessage response = client.get("/world").aggregate().get();
+        final AggregatedHttpMessage response = client.get("/world").aggregate().get();
 
         assertEquals("success", response.content().toStringUtf8());
     }
 
     @Test
     public void givenRequestPath_whenGet_thenRequestToPath() throws Exception {
-        HttpClient client = HttpClient.of(server.uri("/"));
+        final HttpClient client = HttpClient.of(server.uri("/"));
 
-        AggregatedHttpMessage response = client.get("/hello/world").aggregate().get();
+        final AggregatedHttpMessage response = client.get("/hello/world").aggregate().get();
 
         assertEquals("success", response.content().toStringUtf8());
     }
 
     @Test
     public void testPooledResponseDefaultSubscriber() throws Exception {
-        HttpClient client = HttpClient.of(server.uri("/"));
+        final HttpClient client = HttpClient.of(server.uri("/"));
 
-        AggregatedHttpMessage response = client.execute(
+        final AggregatedHttpMessage response = client.execute(
                 HttpHeaders.of(HttpMethod.GET, "/pooled")).aggregate().get();
 
         assertEquals(HttpStatus.OK, response.headers().status());
@@ -534,9 +564,9 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void testPooledResponsePooledSubscriber() throws Exception {
-        HttpClient client = HttpClient.of(server.uri("/"));
+        final HttpClient client = HttpClient.of(server.uri("/"));
 
-        AggregatedHttpMessage response = client.execute(
+        final AggregatedHttpMessage response = client.execute(
                 HttpHeaders.of(HttpMethod.GET, "/pooled-aware")).aggregate().get();
 
         assertEquals(HttpStatus.OK, response.headers().status());
@@ -546,9 +576,9 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void testUnpooledResponsePooledSubscriber() throws Exception {
-        HttpClient client = HttpClient.of(server.uri("/"));
+        final HttpClient client = HttpClient.of(server.uri("/"));
 
-        AggregatedHttpMessage response = client.execute(
+        final AggregatedHttpMessage response = client.execute(
                 HttpHeaders.of(HttpMethod.GET, "/pooled-unaware")).aggregate().get();
 
         assertEquals(HttpStatus.OK, response.headers().status());
@@ -558,11 +588,11 @@ public class HttpClientIntegrationTest {
 
     @Test
     public void testCloseClientFactory() throws Exception {
-        ClientFactory factory = new ClientFactoryBuilder().build();
-        HttpClient client = factory.newClient("none+" + server.uri("/"), HttpClient.class);
-        HttpRequestWriter req = HttpRequest.streaming(HttpHeaders.of(HttpMethod.GET, "/stream-closed"));
-        HttpResponse res = client.execute(req);
-        AtomicReference<HttpObject> obj = new AtomicReference<>();
+        final ClientFactory factory = new ClientFactoryBuilder().build();
+        final HttpClient client = factory.newClient("none+" + server.uri("/"), HttpClient.class);
+        final HttpRequestWriter req = HttpRequest.streaming(HttpHeaders.of(HttpMethod.GET, "/stream-closed"));
+        final HttpResponse res = client.execute(req);
+        final AtomicReference<HttpObject> obj = new AtomicReference<>();
         res.subscribe(new Subscriber<HttpObject>() {
             @Override
             public void onSubscribe(Subscription s) {

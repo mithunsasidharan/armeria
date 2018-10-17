@@ -36,6 +36,7 @@ import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.server.Service;
+import com.linecorp.armeria.server.logging.kafka.KafkaAccessLogWriter;
 import com.linecorp.armeria.server.logging.structured.StructuredLogBuilder;
 import com.linecorp.armeria.server.logging.structured.StructuredLoggingService;
 
@@ -48,7 +49,10 @@ import com.linecorp.armeria.server.logging.structured.StructuredLoggingService;
  * be lost if an application crashes in unclean way.
  *
  * <p>Refer variety of {@link #newDecorator} methods to see how to enable Kafka based structured logging.
+ *
+ * @deprecated Use {@link KafkaAccessLogWriter}.
  */
+@Deprecated
 public class KafkaStructuredLoggingService<I extends Request, O extends Response, L>
         extends StructuredLoggingService<I, O, L> {
     private static final Logger logger = LoggerFactory.getLogger(KafkaStructuredLoggingService.class);
@@ -87,7 +91,7 @@ public class KafkaStructuredLoggingService<I extends Request, O extends Response
     public static <I extends Request, O extends Response, L>
     Function<Service<I, O>, StructuredLoggingService<I, O, L>> newDecorator(
             Producer<byte[], L> producer, String topic,
-            StructuredLogBuilder<L> logBuilder, KeySelector<L> keySelector) {
+            StructuredLogBuilder<L> logBuilder, @Nullable KeySelector<L> keySelector) {
         return service -> new KafkaStructuredLoggingService<>(
                 service, logBuilder, producer, topic, keySelector, false);
     }
@@ -127,8 +131,8 @@ public class KafkaStructuredLoggingService<I extends Request, O extends Response
     public static <I extends Request, O extends Response, L>
     Function<Service<I, O>, StructuredLoggingService<I, O, L>> newDecorator(
             String bootstrapServers, String topic,
-            StructuredLogBuilder<L> logBuilder, KeySelector<L> keySelector) {
-        Producer<byte[], L> producer = new KafkaProducer<>(newDefaultConfig(bootstrapServers));
+            StructuredLogBuilder<L> logBuilder, @Nullable KeySelector<L> keySelector) {
+        final Producer<byte[], L> producer = new KafkaProducer<>(newDefaultConfig(bootstrapServers));
         return service -> new KafkaStructuredLoggingService<>(
                 service, logBuilder, producer, topic, keySelector, true);
     }
@@ -153,7 +157,7 @@ public class KafkaStructuredLoggingService<I extends Request, O extends Response
     }
 
     private static Properties newDefaultConfig(String bootstrapServers) {
-        Properties producerConfig = new Properties();
+        final Properties producerConfig = new Properties();
 
         producerConfig.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
 
@@ -187,9 +191,9 @@ public class KafkaStructuredLoggingService<I extends Request, O extends Response
 
     @Override
     protected void writeLog(RequestLog log, L structuredLog) {
-        byte[] key = keySelector.selectKey(log, structuredLog);
+        final byte[] key = keySelector.selectKey(log, structuredLog);
 
-        ProducerRecord<byte[], L> producerRecord = new ProducerRecord<>(topic, key, structuredLog);
+        final ProducerRecord<byte[], L> producerRecord = new ProducerRecord<>(topic, key, structuredLog);
         producer.send(producerRecord, (metadata, exception) -> {
             if (exception != null) {
                 logger.warn("failed to send service log to Kafka {}", producerRecord, exception);

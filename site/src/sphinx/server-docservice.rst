@@ -1,34 +1,40 @@
-.. _DocService: apidocs/index.html?com/linecorp/armeria/server/docs/DocService.html
-.. _DocServiceBuilder: apidocs/index.html?com/linecorp/armeria/server/docs/DocServiceBuilder.html
-.. _Server: apidocs/index.html?com/linecorp/armeria/server/Server.html
-.. _ServerBuilder: apidocs/index.html?com/linecorp/armeria/server/ServerBuilder.html
-
 .. _server-docservice:
 
 Browsing and invoking services with ``DocService``
 ==================================================
 
-DocService_ is a single-page web application which provides the following useful features:
+:api:`DocService` is a single-page web application which provides the following useful features:
 
-- Browsing the list of services and operations available in the server
+- Browsing the list of gRPC or Thrift services and operations available in the server
 - Invoking a service operation from a web form
 - Creating a permalink for the invocation you've made
 
-First, add DocService_ to the ServerBuilder_:
+First, add :api:`DocService` to the :api:`ServerBuilder`:
 
 .. code-block:: java
 
     ServerBuilder sb = new ServerBuilder();
-    sb.port(8080, "http");
-    // Add some RPC services.
-    sb.service("/hello", THttpService.of(new MyHelloService());
-    // Add DocService.
+    sb.http(8080);
+
+    // Add a Thrift service which implements 'ThriftHelloService'.
+    sb.service("/hello", THttpService.of(new MyThriftHelloService()));
+
+    // Add a gRPC service which implements 'GrpcHelloService'.
+    // Unlike Thrift, you must enable gRPC-Web and unframed requests explicitly.
+    sb.service(new GrpcServiceBuilder().addService(new MyGrpcHelloService())
+                                       .supportedSerializationFormats(
+                                               GrpcSerializationFormats.values())
+                                       .enableUnframedRequests(true)
+                                       .build());
+
+    // Add a DocService which scans all Thrift and gRPC services added to the server.
     sb.serviceUnder("/docs", new DocService());
+
     Server server = sb.build();
     server.start().join();
 
-DocService_ will scan for the supported services when the Server_ starts up. Open http://127.0.0.1:8080/docs/
-in your web browser and you'll see the following screen:
+:api:`DocService` will scan for the supported services when the :api:`Server` starts up.
+Open http://127.0.0.1:8080/docs/ in your web browser and you'll see the following screen:
 
 .. image:: _images/docservice_1.png
 
@@ -39,9 +45,9 @@ the exceptions which may be thrown:
 
 .. image:: _images/docservice_2.png
 
-As you may have noticed, the 'description' column is empty. DocService_ can even show the docstrings you put
-into your ``.thrift`` or ``.proto`` files with a little bit of build configuration. We will visit this later
-in this document.
+As you may have noticed, the 'description' column is empty. :api:`DocService` can even show the docstrings
+you put into your ``.thrift`` or ``.proto`` files with a little bit of build configuration. We will visit this
+later in this document.
 
 Debug form
 ----------
@@ -65,7 +71,7 @@ The result pane right next to the text area you entered the JSON request will sh
 
 The current location of your web browser should be updated like the following:
 
-- ``http://127.0.0.1:8080/docs/#!method/com.example.thrift.HelloService/hello?args=%7B%22name%22%3A%22Armeria%22%7D``
+- ``http://127.0.0.1:8080/docs/#!method/com.example.ThriftHelloService/hello?args=%7B%22name%22%3A%22Armeria%22%7D``
 
 Imagine you build a request that reproduces the problem using the debug form and share the URL of the request
 with your colleagues. It's way more convenient than traditional workflow for replaying an RPC request.
@@ -84,7 +90,7 @@ Example requests and headers
 ----------------------------
 
 You can specify the example requests and HTTP headers which will be used as the default value of the debug form
-when building a DocService_ with a DocServiceBuilder_:
+when building a :api:`DocService` with a :api:`DocServiceBuilder`:
 
 .. code-block:: java
 
@@ -94,13 +100,19 @@ when building a DocService_ with a DocServiceBuilder_:
     ServerBuilder sb = new ServerBuilder();
     ...
     sb.serviceUnder("/docs", new DocServiceBuilder()
+            // HTTP headers for all services
             .exampleHttpHeaders(HttpHeaders.of(AUTHORIZATION, "bearer b03c4fed1a"))
-            .exampleRequest(new HelloService.hello_args("Armeria"))
+            // Thrift example request for 'ThriftHelloService.hello()'
+            .exampleRequest(new ThriftHelloService.hello_args("Armeria"))
+            // gRPC example request for 'GrpcHelloService.Hello()'
+            .exampleRequestForMethod(GrpcHelloServiceGrpc.SERVICE_NAME,
+                                     "Hello", // Method name
+                                     HelloRequest.newBuilder().setName("Armeria").build())
             .build());
     ...
 
-By adding examples to DocService_, your users will be able to play with the services you wrote without a hassle
-and thus will understand them sooner and better.
+By adding examples to :api:`DocService`, your users will be able to play with the services you wrote
+without a hassle and thus will understand them sooner and better.
 
 Adding docstrings
 -----------------

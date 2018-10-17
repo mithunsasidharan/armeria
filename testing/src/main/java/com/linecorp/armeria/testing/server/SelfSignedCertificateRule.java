@@ -16,6 +16,7 @@
 
 package com.linecorp.armeria.testing.server;
 
+import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 
 import java.io.File;
@@ -23,7 +24,11 @@ import java.security.PrivateKey;
 import java.security.SecureRandom;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
+import java.time.Instant;
+import java.time.temporal.TemporalAccessor;
 import java.util.Date;
+
+import javax.annotation.Nullable;
 
 import org.junit.rules.ExternalResource;
 import org.junit.rules.TestRule;
@@ -35,12 +40,18 @@ import io.netty.handler.ssl.util.SelfSignedCertificate;
  */
 public class SelfSignedCertificateRule extends ExternalResource {
 
+    @Nullable
     private final String fqdn;
+    @Nullable
     private final SecureRandom random;
+    @Nullable
     private final Integer bits;
-    private final Date notBefore;
-    private final Date notAfter;
+    @Nullable
+    private final Instant notBefore;
+    @Nullable
+    private final Instant notAfter;
 
+    @Nullable
     private SelfSignedCertificate certificate;
 
     /**
@@ -57,15 +68,30 @@ public class SelfSignedCertificateRule extends ExternalResource {
     /**
      * Creates a new instance.
      *
+     * @deprecated Use {@link #SelfSignedCertificateRule(TemporalAccessor, TemporalAccessor)}.
+     *
      * @param notBefore {@link Certificate} is not valid before this time
      * @param notAfter {@link Certificate} is not valid after this time
      */
+    @Deprecated
+    @SuppressWarnings("UseOfObsoleteDateTimeApi")
     public SelfSignedCertificateRule(Date notBefore, Date notAfter) {
+        this(Instant.ofEpochMilli(requireNonNull(notBefore, "notBefore").getTime()),
+             Instant.ofEpochMilli(requireNonNull(notAfter, "notAfter").getTime()));
+    }
+
+    /**
+     * Creates a new instance.
+     *
+     * @param notBefore {@link Certificate} is not valid before this time
+     * @param notAfter {@link Certificate} is not valid after this time
+     */
+    public SelfSignedCertificateRule(TemporalAccessor notBefore, TemporalAccessor notAfter) {
         fqdn = null;
         random = null;
         bits = null;
-        this.notBefore = new Date(requireNonNull(notBefore, "notBefore").getTime());
-        this.notAfter = new Date(requireNonNull(notAfter, "notAfter").getTime());
+        this.notBefore = Instant.from(requireNonNull(notBefore, "notBefore"));
+        this.notAfter = Instant.from(requireNonNull(notAfter, "notAfter"));
     }
 
     /**
@@ -84,16 +110,33 @@ public class SelfSignedCertificateRule extends ExternalResource {
     /**
      * Creates a new instance.
      *
+     * @deprecated Use {@link #SelfSignedCertificateRule(String, TemporalAccessor, TemporalAccessor)}.
+     *
      * @param fqdn a fully qualified domain name
      * @param notBefore {@link Certificate} is not valid before this time
      * @param notAfter {@link Certificate} is not valid after this time
      */
+    @Deprecated
+    @SuppressWarnings("UseOfObsoleteDateTimeApi")
     public SelfSignedCertificateRule(String fqdn, Date notBefore, Date notAfter) {
+        this(fqdn,
+             Instant.ofEpochMilli(requireNonNull(notBefore, "notBefore").getTime()),
+             Instant.ofEpochMilli(requireNonNull(notAfter, "notAfter").getTime()));
+    }
+
+    /**
+     * Creates a new instance.
+     *
+     * @param fqdn a fully qualified domain name
+     * @param notBefore {@link Certificate} is not valid before this time
+     * @param notAfter {@link Certificate} is not valid after this time
+     */
+    public SelfSignedCertificateRule(String fqdn, TemporalAccessor notBefore, TemporalAccessor notAfter) {
         this.fqdn = requireNonNull(fqdn, "fqdn");
         random = null;
         bits = null;
-        this.notBefore = new Date(requireNonNull(notBefore, "notBefore").getTime());
-        this.notAfter = new Date(requireNonNull(notAfter, "notAfter").getTime());
+        this.notBefore = Instant.from(requireNonNull(notBefore, "notBefore"));
+        this.notAfter = Instant.from(requireNonNull(notAfter, "notAfter"));
     }
 
     /**
@@ -114,6 +157,27 @@ public class SelfSignedCertificateRule extends ExternalResource {
     /**
      * Creates a new instance.
      *
+     * @deprecated Use
+     *     {@link #SelfSignedCertificateRule(String, SecureRandom, int, TemporalAccessor, TemporalAccessor)}
+     *
+     * @param fqdn a fully qualified domain name
+     * @param random the {@link SecureRandom} to use
+     * @param bits the number of bits of the generated private key
+     * @param notBefore {@link Certificate} is not valid before this time
+     * @param notAfter {@link Certificate} is not valid after this time
+     */
+    @Deprecated
+    @SuppressWarnings("UseOfObsoleteDateTimeApi")
+    public SelfSignedCertificateRule(String fqdn, SecureRandom random, int bits,
+                                     Date notBefore, Date notAfter) {
+        this(fqdn, random, bits,
+             Instant.ofEpochMilli(requireNonNull(notBefore, "notBefore").getTime()),
+             Instant.ofEpochMilli(requireNonNull(notAfter, "notAfter").getTime()));
+    }
+
+    /**
+     * Creates a new instance.
+     *
      * @param fqdn a fully qualified domain name
      * @param random the {@link SecureRandom} to use
      * @param bits the number of bits of the generated private key
@@ -121,12 +185,12 @@ public class SelfSignedCertificateRule extends ExternalResource {
      * @param notAfter {@link Certificate} is not valid after this time
      */
     public SelfSignedCertificateRule(String fqdn, SecureRandom random, int bits,
-                                     Date notBefore, Date notAfter) {
+                                     TemporalAccessor notBefore, TemporalAccessor notAfter) {
         this.fqdn = requireNonNull(fqdn, "fqdn");
         this.random = requireNonNull(random, "random");
         this.bits = Integer.valueOf(bits);
-        this.notBefore = new Date(requireNonNull(notBefore, "notBefore").getTime());
-        this.notAfter = new Date(requireNonNull(notAfter, "notAfter").getTime());
+        this.notBefore = Instant.from(requireNonNull(notBefore, "notBefore"));
+        this.notAfter = Instant.from(requireNonNull(notAfter, "notAfter"));
     }
 
     /**
@@ -138,21 +202,27 @@ public class SelfSignedCertificateRule extends ExternalResource {
             if (notBefore == null || notAfter == null) {
                 certificate = new SelfSignedCertificate();
             } else {
-                certificate = new SelfSignedCertificate(notBefore, notAfter);
+                certificate = new SelfSignedCertificate(toDate(notBefore), toDate(notAfter));
             }
         } else if (random == null || bits == null) {
             if (notBefore == null || notAfter == null) {
                 certificate = new SelfSignedCertificate(fqdn);
             } else {
-                certificate = new SelfSignedCertificate(fqdn, notBefore, notAfter);
+                certificate = new SelfSignedCertificate(fqdn, toDate(notBefore), toDate(notAfter));
             }
         } else {
             if (notBefore == null || notAfter == null) {
                 certificate = new SelfSignedCertificate(fqdn, random, bits);
             } else {
-                certificate = new SelfSignedCertificate(fqdn, random, bits, notBefore, notAfter);
+                certificate = new SelfSignedCertificate(fqdn, random, bits,
+                                                        toDate(notBefore), toDate(notAfter));
             }
         }
+    }
+
+    @SuppressWarnings("UseOfObsoleteDateTimeApi")
+    private static Date toDate(Instant notBefore) {
+        return new Date(notBefore.toEpochMilli());
     }
 
     /**
@@ -160,13 +230,16 @@ public class SelfSignedCertificateRule extends ExternalResource {
      */
     @Override
     protected void after() {
-        certificate.delete();
+        if (certificate != null) {
+            certificate.delete();
+        }
     }
 
     /**
      *  Returns the generated {@link X509Certificate}.
      */
     public X509Certificate certificate() {
+        ensureCertificate();
         return certificate.cert();
     }
 
@@ -174,6 +247,7 @@ public class SelfSignedCertificateRule extends ExternalResource {
      * Returns the self-signed certificate file.
      */
     public File certificateFile() {
+        ensureCertificate();
         return certificate.certificate();
     }
 
@@ -181,6 +255,7 @@ public class SelfSignedCertificateRule extends ExternalResource {
      * Returns the {@link PrivateKey} of the self-signed certificate.
      */
     public PrivateKey privateKey() {
+        ensureCertificate();
         return certificate.key();
     }
 
@@ -188,6 +263,11 @@ public class SelfSignedCertificateRule extends ExternalResource {
      * Returns the private key file of the self-signed certificate.
      */
     public File privateKeyFile() {
+        ensureCertificate();
         return certificate.privateKey();
+    }
+
+    private void ensureCertificate() {
+        checkState(certificate != null, "certificate not created");
     }
 }

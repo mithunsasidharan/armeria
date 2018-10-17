@@ -20,18 +20,43 @@ dependencies {
     }
 
     // Netty
-    [ 'netty-transport', 'netty-codec-http2', 'netty-resolver-dns' ].each {
+    [ 'netty-transport', 'netty-codec-http2', 'netty-codec-haproxy', 'netty-resolver-dns' ].each {
         compile "io.netty:$it"
     }
     compile "io.netty:netty-transport-native-unix-common:${managedVersions['io.netty:netty-transport-native-unix-common']}:linux-x86_64"
     compile "io.netty:netty-transport-native-epoll:${managedVersions['io.netty:netty-transport-native-epoll']}:linux-x86_64"
     compile 'io.netty:netty-tcnative-boringssl-static'
-    runtime 'org.javassist:javassist'
 
     // Reactive Streams
     compile 'org.reactivestreams:reactive-streams'
     testCompile 'org.reactivestreams:reactive-streams-tck'
+
+    // Bouncy Castle
+    compile 'org.bouncycastle:bcprov-jdk15on'
 }
+
+sourceSets {
+    main {
+        output.dir project(':docs-client').file('build/javaweb'), builtBy: ':docs-client:copyWeb'
+    }
+}
+
+// Run HttpServerStreamingTest separately with memory constraint.
+tasks.test.exclude '**/HttpServerStreamingTest**'
+tasks.shadedTest.exclude '**/HttpServerStreamingTest**'
+task testStreaming(type: Test,
+                   group: 'Verification',
+                   description: 'Runs the streaming tests.') {
+    // Use small heap for streaming tests to quickly ensure we can stream the content larger than heap.
+    maxHeapSize = '64m'
+
+    testClassesDirs = tasks.test.testClassesDirs
+    classpath = tasks.test.classpath
+
+    include '**/HttpServerStreamingTest**'
+}
+tasks.test.finalizedBy tasks.testStreaming
+tasks.check.dependsOn tasks.testStreaming
 
 // Run the test cases based on reactive-streams-tck
 task testNg(type: Test,
@@ -54,5 +79,7 @@ if (project.hasFlags('coverage')) {
 
 tasks.trimShadedJar.configure {
     keep "class !com.linecorp.armeria.internal.shaded.**,com.linecorp.armeria.** { *; }"
-    keep "class com.linecorp.armeria.internal.shaded.caffeine.** { *; }" // To make the unsafe field access work.
+    // Do not optimize the dependencies that access some fields via sun.misc.Unsafe or reflection only.
+    keep "class com.linecorp.armeria.internal.shaded.caffeine.** { *; }"
+    keep "class com.linecorp.armeria.internal.shaded.jctools.** { *; }"
 }

@@ -16,8 +16,11 @@
 
 package com.linecorp.armeria.client;
 
+import java.net.InetSocketAddress;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+
+import javax.annotation.Nullable;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
@@ -27,21 +30,22 @@ import org.slf4j.LoggerFactory;
 import com.linecorp.armeria.client.HttpResponseDecoder.HttpResponseWrapper;
 import com.linecorp.armeria.common.AbstractRequestContext;
 import com.linecorp.armeria.common.ClosedSessionException;
+import com.linecorp.armeria.common.DefaultHttpHeaders;
 import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
 import com.linecorp.armeria.common.stream.AbortedStreamException;
 import com.linecorp.armeria.common.stream.ClosedPublisherException;
 import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.internal.HttpObjectEncoder;
-import com.linecorp.armeria.internal.logging.LoggingUtil;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.EventLoop;
 import io.netty.handler.codec.http2.Http2Error;
 import io.netty.util.ReferenceCountUtil;
@@ -56,7 +60,7 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
         DONE
     }
 
-    private final ChannelHandlerContext ctx;
+    private final Channel ch;
     private final HttpObjectEncoder encoder;
     private final int id;
     private final HttpRequest request;
@@ -64,7 +68,9 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
     private final ClientRequestContext reqCtx;
     private final RequestLogBuilder logBuilder;
     private final long timeoutMillis;
+    @Nullable
     private Subscription subscription;
+    @Nullable
     private ScheduledFuture<?> timeoutFuture;
     private State state = State.NEEDS_TO_WRITE_FIRST_HEADER;
 
@@ -72,8 +78,7 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
                           int id, HttpRequest request, HttpResponseWrapper response,
                           ClientRequestContext reqCtx, long timeoutMillis) {
 
-        ctx = ch.pipeline().lastContext();
-
+        this.ch = ch;
         this.encoder = encoder;
         this.id = id;
         this.request = request;
@@ -91,8 +96,9 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
         if (future.isSuccess()) {
             if (state == State.DONE) {
                 // Successfully sent the request; schedule the response timeout.
-                response.scheduleTimeout(ctx);
+                response.scheduleTimeout(ch.eventLoop());
             } else {
+                assert subscription != null;
                 subscription.request(1);
             }
             return;
@@ -113,7 +119,7 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
         assert this.subscription == null;
         this.subscription = subscription;
 
-        final EventLoop eventLoop = ctx.channel().eventLoop();
+        final EventLoop eventLoop = ch.eventLoop();
         if (timeoutMillis > 0) {
             timeoutFuture = eventLoop.schedule(
                     () -> {
@@ -134,17 +140,17 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
     }
 
     private void writeFirstHeader() {
-        final Channel ch = ctx.channel();
         final HttpSession session = HttpSession.get(ch);
         if (!session.isActive()) {
             failAndRespond(ClosedSessionException.get());
             return;
         }
 
-        final HttpHeaders firstHeaders = request.headers();
-        final String host = LoggingUtil.remoteHost(firstHeaders, ch);
+        final HttpHeaders firstHeaders = autoFillHeaders(ch);
 
-        logBuilder.startRequest(ch, session.protocol(), host);
+        final SessionProtocol protocol = session.protocol();
+        assert protocol != null;
+        logBuilder.startRequest(ch, protocol);
         logBuilder.requestHeaders(firstHeaders);
 
         if (request.isEmpty()) {
@@ -155,6 +161,49 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
         }
         state = State.NEEDS_DATA_OR_TRAILING_HEADERS;
         cancelTimeout();
+    }
+
+    private HttpHeaders autoFillHeaders(Channel ch) {
+        HttpHeaders requestHeaders = request.headers();
+        if (requestHeaders.isImmutable()) {
+            final HttpHeaders temp = requestHeaders;
+            requestHeaders = new DefaultHttpHeaders(false);
+            requestHeaders.set(temp);
+        }
+
+        final HttpHeaders additionalHeaders = reqCtx.additionalRequestHeaders();
+        if (!additionalHeaders.isEmpty()) {
+            requestHeaders.setAllIfAbsent(additionalHeaders);
+        }
+
+        final SessionProtocol sessionProtocol = reqCtx.sessionProtocol();
+        if (requestHeaders.authority() == null) {
+            final InetSocketAddress isa = (InetSocketAddress) ch.remoteAddress();
+            final String hostname = isa.getHostName();
+            final int port = isa.getPort();
+
+            final String authority;
+            if (port == sessionProtocol.defaultPort()) {
+                authority = hostname;
+            } else {
+                final StringBuilder buf = new StringBuilder(hostname.length() + 6);
+                buf.append(hostname);
+                buf.append(':');
+                buf.append(port);
+                authority = buf.toString();
+            }
+
+            requestHeaders.authority(authority);
+        }
+
+        if (requestHeaders.scheme() == null) {
+            requestHeaders.scheme(sessionProtocol.isTls() ? "https" : "http");
+        }
+
+        if (!requestHeaders.contains(HttpHeaderNames.USER_AGENT)) {
+            requestHeaders.set(HttpHeaderNames.USER_AGENT, HttpHeaderUtil.USER_AGENT.toString());
+        }
+        return requestHeaders;
     }
 
     @Override
@@ -202,7 +251,6 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
     }
 
     private void write(HttpObject o, boolean endOfStream, boolean flush) {
-        final Channel ch = ctx.channel();
         if (!ch.isActive()) {
             ReferenceCountUtil.safeRelease(o);
             fail(ClosedSessionException.get());
@@ -220,10 +268,10 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
         final ChannelFuture future;
         if (o instanceof HttpData) {
             final HttpData data = (HttpData) o;
-            future = encoder.writeData(ctx, id, streamId(), data, endOfStream);
+            future = encoder.writeData(id, streamId(), data, endOfStream);
             logBuilder.increaseRequestLength(data.length());
         } else if (o instanceof HttpHeaders) {
-            future = encoder.writeHeaders(ctx, id, streamId(), (HttpHeaders) o, endOfStream);
+            future = encoder.writeHeaders(id, streamId(), (HttpHeaders) o, endOfStream);
         } else {
             // Should never reach here because we did validation in onNext().
             throw new Error();
@@ -235,10 +283,11 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
 
         future.addListener(this);
         if (flush) {
-            ctx.flush();
+            ch.flush();
         }
 
         if (state == State.DONE) {
+            assert subscription != null;
             subscription.cancel();
         }
     }
@@ -250,6 +299,8 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
     private void fail(Throwable cause) {
         setDone();
         logBuilder.endRequest(cause);
+        logBuilder.endResponse(cause);
+        assert subscription != null;
         subscription.cancel();
     }
 
@@ -261,7 +312,6 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
     private void failAndRespond(Throwable cause) {
         fail(cause);
 
-        final Channel ch = ctx.channel();
         final Http2Error error;
         if (response.isOpen()) {
             response.close(cause);
@@ -276,8 +326,8 @@ final class HttpRequestSubscriber implements Subscriber<HttpObject>, ChannelFutu
         }
 
         if (ch.isActive()) {
-            encoder.writeReset(ctx, id, streamId(), error);
-            ctx.flush();
+            encoder.writeReset(id, streamId(), error);
+            ch.flush();
         }
     }
 

@@ -26,8 +26,14 @@ import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
+
+import javax.annotation.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,9 +57,22 @@ public final class Routers {
      * It consists of several router implementations which use one of Trie and List. It also includes
      * cache mechanism to improve its performance.
      */
-    public static Router<ServiceConfig> ofVirtualHost(Iterable<ServiceConfig> configs) {
+    public static Router<ServiceConfig> ofVirtualHost(VirtualHost virtualHost, Iterable<ServiceConfig> configs,
+                                                      RejectedPathMappingHandler rejectionHandler) {
+        requireNonNull(virtualHost, "virtualHost");
         requireNonNull(configs, "configs");
-        return wrapVirtualHostRouter(defaultRouter(configs, ServiceConfig::pathMapping));
+        requireNonNull(rejectionHandler, "rejectionHandler");
+
+        final BiConsumer<PathMapping, PathMapping> rejectionConsumer = (mapping, existingMapping) -> {
+            try {
+                rejectionHandler.handleDuplicatePathMapping(virtualHost, mapping, existingMapping);
+            } catch (Exception e) {
+                logger.warn("Unexpected exception from a {}:",
+                            RejectedPathMappingHandler.class.getSimpleName(), e);
+            }
+        };
+
+        return wrapVirtualHostRouter(defaultRouter(configs, ServiceConfig::pathMapping, rejectionConsumer));
     }
 
     /**
@@ -63,8 +82,21 @@ public final class Routers {
             List<CompositeServiceEntry<I, O>> entries) {
         requireNonNull(entries, "entries");
 
-        final Router<CompositeServiceEntry<I, O>> delegate =
-                wrapCompositeServiceRouter(defaultRouter(entries, CompositeServiceEntry::pathMapping));
+        final Router<CompositeServiceEntry<I, O>> delegate = wrapCompositeServiceRouter(defaultRouter(
+                entries, CompositeServiceEntry::pathMapping,
+                (mapping, existingMapping) -> {
+                    final String a = mapping.toString();
+                    final String b = existingMapping.toString();
+                    if (a.equals(b)) {
+                        throw new IllegalStateException(
+                                "Your composite service has a duplicate path mapping: " + a);
+                    }
+
+                    throw new IllegalStateException(
+                            "Your composite service has path mappings with a conflict: " +
+                            a + " vs. " + b);
+                }));
+
         return new CompositeRouter<>(delegate, result ->
                 result.isPresent() ? PathMapped.of(result.mapping(), result.mappingResult(),
                                                    result.value().service())
@@ -78,15 +110,20 @@ public final class Routers {
      * transformed to a {@link Router}.
      */
     private static <V> Router<V> defaultRouter(Iterable<V> values,
-                                               Function<V, PathMapping> pathMappingResolver) {
-        return new CompositeRouter<>(routers(values, pathMappingResolver), Function.identity());
+                                               Function<V, PathMapping> pathMappingResolver,
+                                               BiConsumer<PathMapping, PathMapping> rejectionHandler) {
+        return new CompositeRouter<>(routers(values, pathMappingResolver, rejectionHandler),
+                                     Function.identity());
     }
 
     /**
      * Returns a list of {@link Router}s.
      */
     @VisibleForTesting
-    static <V> List<Router<V>> routers(Iterable<V> values, Function<V, PathMapping> pathMappingResolver) {
+    static <V> List<Router<V>> routers(Iterable<V> values, Function<V, PathMapping> pathMappingResolver,
+                                       BiConsumer<PathMapping, PathMapping> rejectionHandler) {
+        rejectDuplicateMapping(values, pathMappingResolver, rejectionHandler);
+
         final ImmutableList.Builder<Router<V>> builder = ImmutableList.builder();
         final List<V> group = new ArrayList<>();
 
@@ -112,6 +149,64 @@ public final class Routers {
             builder.add(router(addingTrie, group, pathMappingResolver));
         }
         return builder.build();
+    }
+
+    private static <V> void rejectDuplicateMapping(
+            Iterable<V> values, Function<V, PathMapping> pathMappingResolver,
+            BiConsumer<PathMapping, PathMapping> rejectionHandler) {
+
+        final Map<String, List<PathMapping>> triePath2mappings = new HashMap<>();
+        for (V v : values) {
+            final PathMapping mapping = pathMappingResolver.apply(v);
+            final Optional<String> triePathOpt = mapping.triePath();
+            if (!triePathOpt.isPresent()) {
+                continue;
+            }
+            final String triePath = triePathOpt.get();
+            final List<PathMapping> existingMappings =
+                    triePath2mappings.computeIfAbsent(triePath, unused -> new ArrayList<>());
+            for (PathMapping existingMapping : existingMappings) {
+                if (mapping.complexity() != existingMapping.complexity()) {
+                    continue;
+                }
+
+                if (mapping.getClass() != existingMapping.getClass()) {
+                    continue;
+                }
+
+                if (!(mapping instanceof HttpHeaderPathMapping)) {
+                    assert mapping.complexity() == 0;
+                    assert existingMapping.complexity() == 0;
+                    rejectionHandler.accept(mapping, existingMapping);
+                    return;
+                }
+
+                final HttpHeaderPathMapping headerMapping = (HttpHeaderPathMapping) mapping;
+                final HttpHeaderPathMapping existingHeaderMapping = (HttpHeaderPathMapping) existingMapping;
+                if (headerMapping.supportedMethods().stream().noneMatch(
+                        method -> existingHeaderMapping.supportedMethods().contains(method))) {
+                    // No overlap in supported methods.
+                    continue;
+                }
+                if (!headerMapping.consumeTypes().isEmpty() &&
+                    headerMapping.consumeTypes().stream().noneMatch(
+                            mediaType -> existingHeaderMapping.consumeTypes().contains(mediaType))) {
+                    // No overlap in consume types.
+                    continue;
+                }
+                if (!headerMapping.produceTypes().isEmpty() &&
+                    headerMapping.produceTypes().stream().noneMatch(
+                            mediaType -> existingHeaderMapping.produceTypes().contains(mediaType))) {
+                    // No overlap in produce types.
+                    continue;
+                }
+
+                rejectionHandler.accept(mapping, existingMapping);
+                return;
+            }
+
+            existingMappings.add(mapping);
+        }
     }
 
     /**
@@ -150,7 +245,7 @@ public final class Routers {
     /**
      * Finds the most suitable service from the given {@link ServiceConfig} list.
      */
-    private static <V> PathMapped<V> findsBest(PathMappingContext mappingCtx, List<V> values,
+    private static <V> PathMapped<V> findsBest(PathMappingContext mappingCtx, @Nullable List<V> values,
                                                Function<V, PathMapping> pathMappingResolver) {
         PathMapped<V> result = PathMapped.empty();
         if (values != null) {
@@ -244,7 +339,7 @@ public final class Routers {
         @Override
         public void dump(OutputStream output) {
             // Do not close this writer in order to keep output stream open.
-            PrintWriter p = new PrintWriter(new OutputStreamWriter(output, StandardCharsets.UTF_8));
+            final PrintWriter p = new PrintWriter(new OutputStreamWriter(output, StandardCharsets.UTF_8));
             p.printf("Dump of %s:%n", this);
             for (int i = 0; i < values.size(); i++) {
                 p.printf("<%d> %s%n", i, values.get(i));

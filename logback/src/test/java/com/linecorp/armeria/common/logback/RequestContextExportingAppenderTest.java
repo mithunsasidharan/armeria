@@ -46,7 +46,6 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 
 import com.linecorp.armeria.client.ClientOptions;
 import com.linecorp.armeria.client.ClientRequestContext;
@@ -59,7 +58,6 @@ import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.SessionProtocol;
@@ -248,7 +246,7 @@ public class RequestContextExportingAppenderTest {
 
         MDC.put("some-prop", "some-value");
         final ServiceRequestContext ctx = newServiceContext("/foo", null);
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+        try (SafeCloseable ignored = ctx.push()) {
             final ILoggingEvent e = log(events);
             final Map<String, String> mdc = e.getMDCPropertyMap();
             assertThat(mdc).containsEntry("req.direction", "INBOUND")
@@ -269,7 +267,7 @@ public class RequestContextExportingAppenderTest {
         });
 
         final ServiceRequestContext ctx = newServiceContext("/foo", null);
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+        try (SafeCloseable ignored = ctx.push()) {
             final ILoggingEvent e = log(events);
             final Map<String, String> mdc = e.getMDCPropertyMap();
             assertThat(mdc).containsEntry("local.host", "server.com")
@@ -301,7 +299,7 @@ public class RequestContextExportingAppenderTest {
         });
 
         final ServiceRequestContext ctx = newServiceContext("/foo", "name=alice");
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+        try (SafeCloseable ignored = ctx.push()) {
             final RequestLogBuilder log = ctx.logBuilder();
             log.endRequest();
             log.endResponse();
@@ -315,13 +313,13 @@ public class RequestContextExportingAppenderTest {
                            .containsEntry("remote.ip", "1.2.3.4")
                            .containsEntry("remote.port", "5678")
                            .containsEntry("req.direction", "INBOUND")
-                           .containsEntry("req.authority", "server.com:8080")
+                           .containsEntry("req.authority", "?")
                            .containsEntry("req.method", "GET")
                            .containsEntry("req.path", "/foo")
                            .containsEntry("req.query", "name=alice")
                            .containsEntry("scheme", "none+h2")
                            .containsEntry("req.content_length", "0")
-                           .containsEntry("res.status_code", "-1")
+                           .containsEntry("res.status_code", "0")
                            .containsEntry("res.content_length", "0")
                            .containsEntry("tls.session_id", "0101020305080d15")
                            .containsEntry("tls.proto", "TLSv1.2")
@@ -346,7 +344,7 @@ public class RequestContextExportingAppenderTest {
         });
 
         final ServiceRequestContext ctx = newServiceContext("/foo", "bar=baz");
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+        try (SafeCloseable ignored = ctx.push()) {
             final RequestLogBuilder log = ctx.logBuilder();
             log.serializationFormat(ThriftSerializationFormats.BINARY);
             log.requestLength(64);
@@ -402,7 +400,9 @@ public class RequestContextExportingAppenderTest {
         return event;
     }
 
-    private static ServiceRequestContext newServiceContext(String path, String query) throws Exception {
+    private static ServiceRequestContext newServiceContext(
+            String path, @Nullable String query) throws Exception {
+
         final Channel ch = mock(Channel.class);
         when(ch.remoteAddress()).thenReturn(
                 new InetSocketAddress(InetAddress.getByAddress("client.com", new byte[] { 1, 2, 3, 4 }),
@@ -424,7 +424,7 @@ public class RequestContextExportingAppenderTest {
 
         final ServiceRequestContext ctx = new DefaultServiceRequestContext(
                 serviceConfig, ch, NoopMeterRegistry.get(), SessionProtocol.H2, mappingCtx,
-                PathMappingResult.of(path, query, ImmutableMap.of()), req, newSslSession());
+                PathMappingResult.of(path, query), req, newSslSession(), null);
 
         ctx.attr(MY_ATTR).set(new CustomValue("some-attr"));
         return ctx;
@@ -440,7 +440,7 @@ public class RequestContextExportingAppenderTest {
         });
 
         final ClientRequestContext ctx = newClientContext("/foo", "type=bar");
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+        try (SafeCloseable ignored = ctx.push()) {
             final ILoggingEvent e = log(events);
             final Map<String, String> mdc = e.getMDCPropertyMap();
             assertThat(mdc).containsEntry("local.host", "client.com")
@@ -477,7 +477,7 @@ public class RequestContextExportingAppenderTest {
         });
 
         final ClientRequestContext ctx = newClientContext("/bar", null);
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+        try (SafeCloseable ignored = ctx.push()) {
             final RequestLogBuilder log = ctx.logBuilder();
             log.serializationFormat(ThriftSerializationFormats.BINARY);
             log.requestLength(64);
@@ -520,7 +520,9 @@ public class RequestContextExportingAppenderTest {
         }
     }
 
-    private static ClientRequestContext newClientContext(String path, String query) throws Exception {
+    private static ClientRequestContext newClientContext(
+            String path, @Nullable String query) throws Exception {
+
         final Channel ch = mock(Channel.class);
         when(ch.remoteAddress()).thenReturn(
                 new InetSocketAddress(InetAddress.getByAddress("server.com", new byte[] { 1, 2, 3, 4 }),
@@ -537,14 +539,13 @@ public class RequestContextExportingAppenderTest {
                 Endpoint.of("server.com", 8080), req.method(), path, query, null,
                 ClientOptions.DEFAULT, req) {
 
-            @Nullable
             @Override
             public SSLSession sslSession() {
                 return newSslSession();
             }
         };
 
-        ctx.logBuilder().startRequest(ch, ctx.sessionProtocol(), "some-host.server.com");
+        ctx.logBuilder().startRequest(ch, ctx.sessionProtocol());
 
         ctx.attr(MY_ATTR).set(new CustomValue("some-attr"));
         return ctx;
@@ -578,13 +579,15 @@ public class RequestContextExportingAppenderTest {
         private final VirtualHost virtualHost;
         private final String hostname;
         private final String path;
+        @Nullable
         private final String query;
         private final HttpHeaders headers;
         private final List<Object> summary;
+        @Nullable
         private Throwable delayedCause;
 
         DummyPathMappingContext(VirtualHost virtualHost, String hostname,
-                                String path, String query, HttpHeaders headers) {
+                                String path, @Nullable String query, HttpHeaders headers) {
             this.virtualHost = requireNonNull(virtualHost, "virtualHost");
             this.hostname = requireNonNull(hostname, "hostname");
             this.path = requireNonNull(path, "path");

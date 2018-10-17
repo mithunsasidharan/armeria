@@ -132,7 +132,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
                 return false;
             }
 
-            ByteBufOrStream that = (ByteBufOrStream) o;
+            final ByteBufOrStream that = (ByteBufOrStream) o;
 
             return Objects.equals(buf, that.buf) && Objects.equals(stream, that.stream);
         }
@@ -175,8 +175,13 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
 
     private boolean compressedFlag;
     private boolean endOfStream;
-    private CompositeByteBuf nextFrame;
+
+    @Nullable
+    private ByteBuf firstFrame;
+
+    @Nullable
     private CompositeByteBuf unprocessed;
+
     private long pendingDeliveries;
     private boolean deliveryStalled = true;
     private boolean inDelivery;
@@ -242,7 +247,16 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
                 buf = alloc.buffer(data.length());
                 buf.writeBytes(data.array(), data.offset(), data.length());
             }
-            unprocessed.addComponent(true, buf);
+            if (unprocessed != null) {
+                unprocessed.addComponent(true, buf);
+            } else if (firstFrame == null) {
+                firstFrame = buf;
+            } else {
+                unprocessed = alloc.compositeBuffer();
+                unprocessed.addComponent(true, firstFrame);
+                unprocessed.addComponent(true, buf);
+                firstFrame = null;
+            }
         }
 
         // Indicate that all of the data for this stream has been received.
@@ -257,15 +271,15 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
     @Override
     public void close() {
         try {
+            if (firstFrame != null) {
+                firstFrame.release();
+            }
             if (unprocessed != null) {
                 unprocessed.release();
             }
-            if (nextFrame != null) {
-                nextFrame.release();
-            }
         } finally {
+            firstFrame = null;
             unprocessed = null;
-            nextFrame = null;
         }
     }
 
@@ -273,7 +287,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
      * Indicates whether or not this deframer has been closed.
      */
     public boolean isClosed() {
-        return unprocessed == null;
+        return firstFrame == null && unprocessed == null;
     }
 
     public ArmeriaMessageDeframer decompressor(Decompressor decompressor) {
@@ -301,14 +315,14 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         inDelivery = true;
         try {
             // Process the uncompressed bytes.
-            while (pendingDeliveries > 0 && readRequiredBytes()) {
+            while (pendingDeliveries > 0 && hasRequiredBytes()) {
                 switch (state) {
                     case HEADER:
-                        processHeader();
+                        readHeader();
                         break;
                     case BODY:
                         // Read the body and deliver the message.
-                        processBody();
+                        readBody();
 
                         // Since we've delivered a message, decrement the number of pending
                         // deliveries remaining.
@@ -327,10 +341,10 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
             * frame and not in unprocessed.  If there is extra data but no pending deliveries, it will
             * be in unprocessed.
             */
-            boolean stalled = !unprocessed.isReadable();
+            final boolean stalled = !hasRequiredBytes();
 
             if (endOfStream && stalled) {
-                boolean havePartialMessage = nextFrame != null && nextFrame.isReadable();
+                final boolean havePartialMessage = readableBuf().isReadable();
                 if (!havePartialMessage) {
                     listener.endOfStream();
                     deliveryStalled = false;
@@ -348,39 +362,17 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         }
     }
 
-    /**
-     * Attempts to read the required bytes into nextFrame.
-     *
-     * @return {@code true} if all of the required bytes have been read.
-     */
-    private boolean readRequiredBytes() {
-        if (nextFrame == null) {
-            nextFrame = alloc.compositeBuffer();
-        }
-
-        // Read until the buffer contains all the required bytes.
-        int missingBytes;
-        while ((missingBytes = requiredLength - nextFrame.readableBytes()) > 0) {
-            int numUnprocessedBytes = unprocessed.readableBytes();
-            if (numUnprocessedBytes == 0) {
-                // No more data is available.
-                return false;
-            }
-            int toRead = Math.min(missingBytes, numUnprocessedBytes);
-            if (toRead > 0) {
-                nextFrame.addComponent(true, unprocessed.readBytes(toRead));
-                unprocessed.discardReadComponents();
-            }
-        }
-        return true;
+    private boolean hasRequiredBytes() {
+        return readableBuf().readableBytes() >= requiredLength;
     }
 
     /**
      * Processes the gRPC compression header which is composed of the compression flag and the outer
      * frame length.
      */
-    private void processHeader() {
-        int type = nextFrame.readUnsignedByte();
+    private void readHeader() {
+        final ByteBuf buf = readableBuf();
+        final int type = buf.readUnsignedByte();
         if ((type & RESERVED_MASK) != 0) {
             throw Status.INTERNAL.withDescription(
                     DEBUG_STRING + ": Frame header malformed: reserved bits not zero")
@@ -389,7 +381,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         compressedFlag = (type & COMPRESSED_FLAG_MASK) != 0;
 
         // Update the required length to include the length of the frame.
-        requiredLength = nextFrame.readInt();
+        requiredLength = buf.readInt();
         if (requiredLength < 0 || requiredLength > maxMessageSizeBytes) {
             throw Status.RESOURCE_EXHAUSTED.withDescription(
                     String.format("%s: Frame size %d exceeds maximum: %d. ",
@@ -405,9 +397,9 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
      * Processes the body of the gRPC compression frame. A single compression frame may contain
      * several gRPC messages within it.
      */
-    private void processBody() {
-        ByteBufOrStream msg = compressedFlag ? getCompressedBody() : getUncompressedBody();
-        nextFrame = null;
+    private void readBody() {
+        final ByteBuf buf = readBytes(requiredLength);
+        final ByteBufOrStream msg = compressedFlag ? getCompressedBody(buf) : getUncompressedBody(buf);
         listener.messageRead(msg);
 
         // Done with this frame, begin processing the next header.
@@ -415,12 +407,37 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         requiredLength = HEADER_LENGTH;
     }
 
-    private ByteBufOrStream getUncompressedBody() {
-        return new ByteBufOrStream(nextFrame.consolidate());
+    private ByteBuf readableBuf() {
+        if (firstFrame != null) {
+            return firstFrame;
+        } else {
+            assert unprocessed != null;
+            return unprocessed;
+        }
     }
 
-    private ByteBufOrStream getCompressedBody() {
+    private ByteBuf readBytes(int length) {
+        if (firstFrame != null) {
+            if (firstFrame.readableBytes() == length) {
+                return firstFrame;
+            } else {
+                return firstFrame.retainedSlice(firstFrame.readerIndex(), length);
+            }
+        } else {
+            assert unprocessed != null;
+            final ByteBuf buf = unprocessed.readBytes(length);
+            unprocessed.discardReadComponents();
+            return buf;
+        }
+    }
+
+    private static ByteBufOrStream getUncompressedBody(ByteBuf buf) {
+        return new ByteBufOrStream(buf);
+    }
+
+    private ByteBufOrStream getCompressedBody(ByteBuf buf) {
         if (decompressor == Codec.Identity.NONE) {
+            buf.release();
             throw Status.INTERNAL.withDescription(
                     DEBUG_STRING + ": Can't decode compressed frame as compression not configured.")
                                  .asRuntimeException();
@@ -428,8 +445,8 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
 
         try {
             // Enforce the maxMessageSizeBytes limit on the returned stream.
-            InputStream unlimitedStream =
-                    decompressor.decompress(new ByteBufInputStream(nextFrame, true));
+            final InputStream unlimitedStream =
+                    decompressor.decompress(new ByteBufInputStream(buf, true));
             return new ByteBufOrStream(
                     new SizeEnforcingInputStream(unlimitedStream, maxMessageSizeBytes, DEBUG_STRING));
         } catch (IOException e) {
@@ -456,7 +473,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
 
         @Override
         public int read() throws IOException {
-            int result = in.read();
+            final int result = in.read();
             if (result != -1) {
                 count++;
             }
@@ -467,7 +484,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
 
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
-            int result = in.read(b, off, len);
+            final int result = in.read(b, off, len);
             if (result != -1) {
                 count += result;
             }
@@ -478,7 +495,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
 
         @Override
         public long skip(long n) throws IOException {
-            long result = in.skip(n);
+            final long result = in.skip(n);
             count += result;
             verifySize();
             reportCount();
@@ -513,7 +530,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
 
         private void verifySize() {
             if (count > maxMessageSize) {
-                throw Status.INTERNAL.withDescription(String.format(
+                throw Status.RESOURCE_EXHAUSTED.withDescription(String.format(
                         "%s: Compressed frame exceeds maximum frame size: %d. Bytes read: %d. ",
                         debugString, maxMessageSize, count)).asRuntimeException();
             }

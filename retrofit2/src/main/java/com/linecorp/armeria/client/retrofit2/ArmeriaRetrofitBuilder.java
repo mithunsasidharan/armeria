@@ -24,10 +24,13 @@ import java.net.URI;
 import java.util.concurrent.Executor;
 import java.util.function.BiFunction;
 
+import javax.annotation.Nullable;
+
 import com.linecorp.armeria.client.ClientFactory;
 import com.linecorp.armeria.client.ClientOptionsBuilder;
 import com.linecorp.armeria.client.HttpClient;
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
+import com.linecorp.armeria.common.CommonPools;
 import com.linecorp.armeria.common.Scheme;
 import com.linecorp.armeria.common.SessionProtocol;
 
@@ -38,6 +41,7 @@ import retrofit2.Callback;
 import retrofit2.Converter;
 import retrofit2.Retrofit;
 import retrofit2.Retrofit.Builder;
+import retrofit2.http.Streaming;
 
 /**
  * A helper class for creating a new {@link Retrofit} instance with {@link ArmeriaCallFactory}.
@@ -73,7 +77,10 @@ public final class ArmeriaRetrofitBuilder {
 
     private final Retrofit.Builder retrofitBuilder;
     private final ClientFactory clientFactory;
+    @Nullable
     private String baseUrl;
+    private boolean streaming;
+    private Executor callbackExecutor = CommonPools.blockingTaskExecutor();
     private BiFunction<String, ? super ClientOptionsBuilder, ClientOptionsBuilder> configurator =
             DEFAULT_CONFIGURATOR;
 
@@ -99,10 +106,10 @@ public final class ArmeriaRetrofitBuilder {
      */
     public ArmeriaRetrofitBuilder baseUrl(String baseUrl) {
         requireNonNull(baseUrl, "baseUrl");
-        URI uri = URI.create(baseUrl);
+        final URI uri = URI.create(baseUrl);
         checkArgument(SessionProtocol.find(uri.getScheme()).isPresent(),
                       "baseUrl must have an HTTP scheme: %s", baseUrl);
-        String path = uri.getPath();
+        final String path = uri.getPath();
         if (!path.isEmpty() && !SLASH.equals(path.substring(path.length() - 1))) {
             throw new IllegalArgumentException("baseUrl must end with /: " + baseUrl);
         }
@@ -151,7 +158,26 @@ public final class ArmeriaRetrofitBuilder {
      * @see Retrofit.Builder#callbackExecutor(Executor)
      */
     public ArmeriaRetrofitBuilder callbackExecutor(Executor executor) {
-        retrofitBuilder.callbackExecutor(requireNonNull(executor, "executor"));
+        callbackExecutor = requireNonNull(executor, "executor");
+        retrofitBuilder.callbackExecutor(callbackExecutor);
+        return this;
+    }
+
+    /**
+     * Sets the streaming flag to make Armeria client fully support {@link Streaming}.
+     * If this flag is {@code false}, Armeria client will buffer all data and call a callback after receiving
+     * the data completely, even if a service method was annotated with {@link Streaming}.
+     * By enabling this flag, Armeria client will use the {@link Executor} specified with
+     * {@link ArmeriaRetrofitBuilder#callbackExecutor(Executor)} to read the data in a blocking way.
+     *
+     * <p>Note: It is not recommended to have the service methods both with and without the
+     * {@link Streaming} annotation in the same interface. Consider separating them into different
+     * interfaces and using different builder to build the service.</p>
+     *
+     * @see Streaming
+     */
+    public ArmeriaRetrofitBuilder streaming(boolean streaming) {
+        this.streaming = streaming;
         return this;
     }
 
@@ -176,7 +202,10 @@ public final class ArmeriaRetrofitBuilder {
         final HttpClient baseHttpClient = HttpClient.of(
                 clientFactory, fullUri, configurator.apply(fullUri, new ClientOptionsBuilder()).build());
         return retrofitBuilder.baseUrl(convertToOkHttpUrl(baseHttpClient, uri.getPath(), GROUP_PREFIX))
-                              .callFactory(new ArmeriaCallFactory(baseHttpClient, clientFactory, configurator))
+                              .callFactory(new ArmeriaCallFactory(
+                                      baseHttpClient, clientFactory, configurator,
+                                      streaming ? SubscriberFactory.streaming(callbackExecutor)
+                                                : SubscriberFactory.blocking()))
                               .build();
     }
 
@@ -186,11 +215,14 @@ public final class ArmeriaRetrofitBuilder {
                                                       .map(Scheme::sessionProtocol)
                                                       .orElseGet(() -> SessionProtocol.of(uri.getScheme()));
         final String authority = uri.getAuthority();
-        String protocol = sessionProtocol.isTls() ? "https" : "http";
+        final String protocol = sessionProtocol.isTls() ? "https" : "http";
+        final HttpUrl parsed;
         if (authority.startsWith("group:")) {
-            return HttpUrl.parse(protocol + "://" + authority.replace("group:", groupPrefix) + basePath);
+            parsed = HttpUrl.parse(protocol + "://" + authority.replace("group:", groupPrefix) + basePath);
         } else {
-            return HttpUrl.parse(protocol + "://" + authority + basePath);
+            parsed = HttpUrl.parse(protocol + "://" + authority + basePath);
         }
+        assert parsed != null;
+        return parsed;
     }
 }

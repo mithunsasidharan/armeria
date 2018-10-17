@@ -65,13 +65,13 @@ public abstract class DocStringExtractor {
     private Map<String, String> getAllDocStrings0(ClassLoader classLoader) {
         final Configuration configuration = new ConfigurationBuilder()
                 .filterInputsBy(new FilterBuilder().includePackage(path))
-                .setUrls(ClasspathHelper.forPackage(path))
+                .setUrls(ClasspathHelper.forPackage(path, classLoader))
                 .addClassLoader(classLoader)
                 .setScanners(new ResourcesScanner());
         if (configuration.getUrls() == null || configuration.getUrls().isEmpty()) {
             return Collections.emptyMap();
         }
-        Map<String, byte[]> files = new Reflections(configuration)
+        final Map<String, byte[]> files = new Reflections(configuration)
                 .getResources(this::acceptFile).stream()
                 .map(f -> {
                     try {

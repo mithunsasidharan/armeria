@@ -16,8 +16,7 @@
 
 package com.linecorp.armeria.server.tomcat;
 
-import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.File;
 
@@ -27,7 +26,6 @@ import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
-import org.apache.http.util.EntityUtils;
 import org.junit.AfterClass;
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -52,12 +50,13 @@ public class UnmanagedTomcatServiceTest {
                                         "tomcat-" + UnmanagedTomcatServiceTest.class.getSimpleName() + "-1");
 
             tomcatWithWebApp.addWebapp("", WebAppContainerTest.webAppRoot().getAbsolutePath());
-            TomcatUtil.engine(tomcatWithWebApp.getService()).setName("tomcatWithWebApp");
+            TomcatUtil.engine(tomcatWithWebApp.getService(), "foo").setName("tomcatWithWebApp");
 
             tomcatWithoutWebApp = new Tomcat();
             tomcatWithoutWebApp.setPort(0);
             tomcatWithoutWebApp.setBaseDir("build" + File.separatorChar +
                                            "tomcat-" + UnmanagedTomcatServiceTest.class.getSimpleName() + "-2");
+            assertThat(TomcatUtil.engine(tomcatWithoutWebApp.getService(), "bar")).isNotNull();
 
             // Start the Tomcats.
             tomcatWithWebApp.start();
@@ -65,8 +64,10 @@ public class UnmanagedTomcatServiceTest {
 
             // Bind them to the Server.
             sb.serviceUnder("/empty/", TomcatService.forConnector("someHost", new Connector()))
-              .serviceUnder("/no-webapp/", TomcatService.forConnector(tomcatWithoutWebApp.getConnector()))
-              .serviceUnder("/some-webapp/", TomcatService.forConnector(tomcatWithWebApp.getConnector()));
+              .serviceUnder("/some-webapp-nohostname/",
+                            TomcatService.forConnector(tomcatWithWebApp.getConnector()))
+              .serviceUnder("/no-webapp/", TomcatService.forTomcat(tomcatWithoutWebApp))
+              .serviceUnder("/some-webapp/", TomcatService.forTomcat(tomcatWithWebApp));
         }
     };
 
@@ -87,7 +88,8 @@ public class UnmanagedTomcatServiceTest {
         try (CloseableHttpClient hc = HttpClients.createMinimal()) {
             try (CloseableHttpResponse res = hc.execute(new HttpGet(server.uri("/empty/")))) {
                 // as connector is not configured, TomcatServiceInvocationHandler will throw.
-                assertThat(res.getStatusLine().toString(), is("HTTP/1.1 503 Service Unavailable"));
+                assertThat(res.getStatusLine().toString()).isEqualTo(
+                        "HTTP/1.1 503 Service Unavailable");
             }
         }
     }
@@ -96,9 +98,11 @@ public class UnmanagedTomcatServiceTest {
     public void unconfiguredWebApp() throws Exception {
         try (CloseableHttpClient hc = HttpClients.createMinimal()) {
             try (CloseableHttpResponse res = hc.execute(new HttpGet(server.uri("/no-webapp/")))) {
-                // as no webapp is configured inside tomcat, 404 will be thrown.
-                System.err.println("Entity: " + EntityUtils.toString(res.getEntity()));
-                assertThat(res.getStatusLine().toString(), is("HTTP/1.1 404 Not Found"));
+                // When no webapp is configured, Tomcat sends:
+                // - 400 Bad Request response for 9.0.10+
+                // - 404 Not Found for other versions
+                final String statusLine = res.getStatusLine().toString();
+                assertThat(statusLine).matches("^HTTP/1\\.1 (400 Bad Request|404 Not Found)$");
             }
         }
     }
@@ -107,7 +111,16 @@ public class UnmanagedTomcatServiceTest {
     public void ok() throws Exception {
         try (CloseableHttpClient hc = HttpClients.createMinimal()) {
             try (CloseableHttpResponse res = hc.execute(new HttpGet(server.uri("/some-webapp/")))) {
-                assertThat(res.getStatusLine().toString(), is("HTTP/1.1 200 OK"));
+                assertThat(res.getStatusLine().toString()).isEqualTo("HTTP/1.1 200 OK");
+            }
+        }
+    }
+
+    @Test
+    public void okNoHostName() throws Exception {
+        try (CloseableHttpClient hc = HttpClients.createMinimal()) {
+            try (CloseableHttpResponse res = hc.execute(new HttpGet(server.uri("/some-webapp-nohostname/")))) {
+                assertThat(res.getStatusLine().toString()).isEqualTo("HTTP/1.1 200 OK");
             }
         }
     }

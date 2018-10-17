@@ -24,6 +24,8 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
+import javax.annotation.Nullable;
+
 import org.junit.rules.ExternalResource;
 import org.junit.rules.TestRule;
 
@@ -134,7 +136,7 @@ public abstract class ServerRule extends ExternalResource {
         return server;
     }
 
-    private static boolean isStopped(Server server) {
+    private static boolean isStopped(@Nullable Server server) {
         return server == null || server.activePorts().isEmpty();
     }
 
@@ -164,7 +166,7 @@ public abstract class ServerRule extends ExternalResource {
      */
     public int port(SessionProtocol protocol) {
         return server().activePorts().values().stream()
-                       .filter(p1 -> p1.protocol() == protocol).findAny()
+                       .filter(p1 -> p1.hasProtocol(protocol)).findAny()
                        .flatMap(p -> Optional.of(p.localAddress().getPort()))
                        .orElseThrow(() -> new IllegalStateException(protocol + " port not open"));
     }
@@ -187,7 +189,7 @@ public abstract class ServerRule extends ExternalResource {
         final Server server = this.server.get();
         return server != null &&
                server.activePorts().values().stream()
-                     .anyMatch(port -> port.protocol() == protocol);
+                     .anyMatch(port -> port.hasProtocol(protocol));
     }
 
     /**
@@ -209,6 +211,48 @@ public abstract class ServerRule extends ExternalResource {
         }
 
         throw new IllegalStateException("can't find a useful active port");
+    }
+
+    /**
+     * Returns the URI for the {@link Server} of the specified protocol and format.
+     *
+     * @throws IllegalStateException if the {@link Server} is not started or
+     *                               it did not open a port of the protocol.
+     */
+    public String uri(SessionProtocol protocol, SerializationFormat format, String path) {
+        requireNonNull(protocol, "protocol");
+        requireNonNull(format, "format");
+        requireNonNull(path, "path");
+
+        // This will ensure that the server has started.
+        server();
+
+        return format.uriText() + '+' + uri(protocol, path);
+    }
+
+    /**
+     * Returns the URI for the {@link Server} of the specified protocol.
+     *
+     * @throws IllegalStateException if the {@link Server} is not started or
+     *                               it did not open a port of the protocol.
+     */
+    public String uri(SessionProtocol protocol, String path) {
+        requireNonNull(protocol, "protocol");
+        requireNonNull(path, "path");
+
+        // This will ensure that the server has started.
+        server();
+
+        final int port;
+        if (!protocol.isTls() && hasHttp()) {
+            port = httpPort();
+        } else if (protocol.isTls() && hasHttps()) {
+            port = httpsPort();
+        } else {
+            throw new IllegalStateException("can't find the specified port");
+        }
+
+        return protocol.uriText() + "://127.0.0.1:" + port + path;
     }
 
     /**

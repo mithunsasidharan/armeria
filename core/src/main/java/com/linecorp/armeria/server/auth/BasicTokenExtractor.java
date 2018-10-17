@@ -23,13 +23,16 @@ import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import javax.annotation.Nullable;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Strings;
 
-import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
+
+import io.netty.util.AsciiString;
 
 /**
  * Extracts {@link BasicToken} from {@link HttpHeaders}, in order to be used by {@link HttpAuthServiceBuilder}.
@@ -42,36 +45,44 @@ final class BasicTokenExtractor implements Function<HttpHeaders, BasicToken> {
             "\\s*(?i)basic\\s+(?<encoded>\\S+)\\s*");
     private static final Decoder BASE64_DECODER = Base64.getDecoder();
 
+    private final AsciiString header;
+
+    BasicTokenExtractor(AsciiString header) {
+        this.header = header;
+    }
+
+    @Nullable
     @Override
     public BasicToken apply(HttpHeaders headers) {
-        String authorization = headers.get(HttpHeaderNames.AUTHORIZATION);
+        final String authorization = headers.get(header);
         if (Strings.isNullOrEmpty(authorization)) {
             return null;
         }
 
-        Matcher matcher = AUTHORIZATION_HEADER_PATTERN.matcher(authorization);
+        final Matcher matcher = AUTHORIZATION_HEADER_PATTERN.matcher(authorization);
         if (!matcher.matches()) {
             logger.warn("Invalid authorization header: {}", authorization);
             return null;
         }
 
-        String base64 = matcher.group("encoded");
-        byte[] decoded;
+        final String base64 = matcher.group("encoded");
+        final byte[] decoded;
         try {
             decoded = BASE64_DECODER.decode(base64);
         } catch (IllegalArgumentException e) {
+            // No need to log stack trace for this because the reason is so obvious.
             logger.warn("Base64 decoding failed: {}", base64);
             return null;
         }
 
-        String credential = new String(decoded, StandardCharsets.UTF_8);
-        int sep = credential.indexOf(':');
+        final String credential = new String(decoded, StandardCharsets.UTF_8);
+        final int sep = credential.indexOf(':');
         if (sep == -1) {
             logger.warn("Invalid credential: {}", credential);
             return null;
         }
-        String username = credential.substring(0, sep);
-        String password = credential.substring(sep + 1);
+        final String username = credential.substring(0, sep);
+        final String password = credential.substring(sep + 1);
 
         return BasicToken.of(username, password);
     }

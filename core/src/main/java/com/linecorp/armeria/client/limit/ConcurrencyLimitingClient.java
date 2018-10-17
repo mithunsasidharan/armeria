@@ -29,7 +29,6 @@ import com.linecorp.armeria.client.ClientRequestContext;
 import com.linecorp.armeria.client.ResponseTimeoutException;
 import com.linecorp.armeria.client.SimpleDecoratingClient;
 import com.linecorp.armeria.common.Request;
-import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.util.SafeCloseable;
 
@@ -228,7 +227,7 @@ public abstract class ConcurrencyLimitingClient<I extends Request, O extends Res
         public void run() {
             isRun = true;
 
-            ScheduledFuture<?> timeoutFuture = get();
+            final ScheduledFuture<?> timeoutFuture = get();
             if (timeoutFuture != null) {
                 if (timeoutFuture.isDone() || !timeoutFuture.cancel(false)) {
                     // Timeout task ran already or is determined to run.
@@ -237,7 +236,7 @@ public abstract class ConcurrencyLimitingClient<I extends Request, O extends Res
                 }
             }
 
-            try (SafeCloseable ignored = RequestContext.push(ctx)) {
+            try (SafeCloseable ignored = ctx.push()) {
                 try {
                     final O actualRes = delegate().execute(ctx, req);
                     actualRes.completionFuture().whenCompleteAsync((unused, cause) -> {

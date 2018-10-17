@@ -23,21 +23,23 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
-import java.util.function.Consumer;
-import java.util.stream.Collectors;
+
+import javax.annotation.Nullable;
 
 import com.linecorp.armeria.common.Request;
-import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.internal.ConnectionLimitingHandler;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 import io.micrometer.core.instrument.MeterRegistry;
+import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
-import io.netty.handler.ssl.SslContext;
 import io.netty.util.DomainNameMapping;
 import io.netty.util.DomainNameMappingBuilder;
+import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
 
 /**
  * {@link Server} configuration.
@@ -47,6 +49,7 @@ public final class ServerConfig {
     /**
      * Initialized later by {@link Server} via {@link #setServer(Server)}.
      */
+    @Nullable
     private Server server;
 
     private final List<ServerPort> ports;
@@ -57,6 +60,7 @@ public final class ServerConfig {
 
     private final EventLoopGroup workerGroup;
     private final boolean shutdownWorkerGroupOnStop;
+    private final Executor startStopExecutor;
     private final int maxNumConnections;
     private final long defaultRequestTimeoutMillis;
     private final long idleTimeoutMillis;
@@ -74,20 +78,29 @@ public final class ServerConfig {
 
     private final String serviceLoggerPrefix;
 
-    private final Consumer<RequestLog> accessLogWriter;
+    private final AccessLogWriter accessLogWriter;
+    private final boolean shutdownAccessLogWriterOnStop;
 
+    private final int proxyProtocolMaxTlvSize;
+
+    private final Map<ChannelOption<?>, ?> channelOptions;
+    private final Map<ChannelOption<?>, ?> childChannelOptions;
+
+    @Nullable
     private String strVal;
 
     ServerConfig(
             Iterable<ServerPort> ports,
             VirtualHost defaultVirtualHost, Iterable<VirtualHost> virtualHosts,
-            EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnStop,
+            EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnStop, Executor startStopExecutor,
             int maxNumConnections, long idleTimeoutMillis,
             long defaultRequestTimeoutMillis, long defaultMaxRequestLength,
             int defaultMaxHttp1InitialLineLength, int defaultMaxHttp1HeaderSize, int defaultMaxHttp1ChunkSize,
             Duration gracefulShutdownQuietPeriod, Duration gracefulShutdownTimeout,
             Executor blockingTaskExecutor, MeterRegistry meterRegistry, String serviceLoggerPrefix,
-            Consumer<RequestLog> accessLogWriter) {
+            AccessLogWriter accessLogWriter, boolean shutdownAccessLogWriterOnStop, int proxyProtocolMaxTlvSize,
+            Map<ChannelOption<?>, Object> channelOptions,
+            Map<ChannelOption<?>, Object> childChannelOptions) {
 
         requireNonNull(ports, "ports");
         requireNonNull(defaultVirtualHost, "defaultVirtualHost");
@@ -96,6 +109,7 @@ public final class ServerConfig {
         // Set the primitive properties.
         this.workerGroup = requireNonNull(workerGroup, "workerGroup");
         this.shutdownWorkerGroupOnStop = shutdownWorkerGroupOnStop;
+        this.startStopExecutor = requireNonNull(startStopExecutor, "startStopExecutor");
         this.maxNumConnections = validateMaxNumConnections(maxNumConnections);
         this.idleTimeoutMillis = validateIdleTimeoutMillis(idleTimeoutMillis);
         this.defaultRequestTimeoutMillis = validateDefaultRequestTimeoutMillis(defaultRequestTimeoutMillis);
@@ -123,6 +137,11 @@ public final class ServerConfig {
         this.meterRegistry = requireNonNull(meterRegistry, "meterRegistry");
         this.serviceLoggerPrefix = ServiceConfig.validateLoggerName(serviceLoggerPrefix, "serviceLoggerPrefix");
         this.accessLogWriter = requireNonNull(accessLogWriter, "accessLogWriter");
+        this.shutdownAccessLogWriterOnStop = shutdownAccessLogWriterOnStop;
+        this.channelOptions = Collections.unmodifiableMap(
+                new Object2ObjectArrayMap<>(requireNonNull(channelOptions, "channelOptions")));
+        this.childChannelOptions = Collections.unmodifiableMap(
+                new Object2ObjectArrayMap<>(requireNonNull(childChannelOptions, "childChannelOptions")));
 
         // Set localAddresses.
         final List<ServerPort> portsCopy = new ArrayList<>();
@@ -139,8 +158,13 @@ public final class ServerConfig {
 
         this.ports = Collections.unmodifiableList(portsCopy);
 
+        if (this.ports.stream().anyMatch(ServerPort::hasProxyProtocol)) {
+            this.proxyProtocolMaxTlvSize = proxyProtocolMaxTlvSize;
+        } else {
+            this.proxyProtocolMaxTlvSize = 0;
+        }
+
         // Set virtual host definitions and initialize their domain name mapping.
-        defaultVirtualHost = normalizeDefaultVirtualHost(defaultVirtualHost, portsCopy);
         final DomainNameMappingBuilder<VirtualHost> mappingBuilder =
                 new DomainNameMappingBuilder<>(defaultVirtualHost);
         final List<VirtualHost> virtualHostsCopy = new ArrayList<>();
@@ -222,21 +246,6 @@ public final class ServerConfig {
         }
     }
 
-    private static VirtualHost normalizeDefaultVirtualHost(VirtualHost h, List<ServerPort> ports) {
-        final SslContext sslCtx = h.sslContext();
-        // The default virtual host must have sslContext set if TLS is in use.
-        if (sslCtx == null && ports.stream().anyMatch(p -> p.protocol().isTls())) {
-            throw new IllegalArgumentException(
-                    "defaultVirtualHost must have sslContext set when TLS is enabled.");
-        }
-
-        return new VirtualHost(
-                h.defaultHostname(), "*", sslCtx,
-                h.serviceConfigs().stream().map(
-                        e -> new ServiceConfig(e.pathMapping(), e.service(), e.loggerName().orElse(null)))
-                 .collect(Collectors.toList()), h.producibleMediaTypes());
-    }
-
     /**
      * Returns the {@link Server}.
      */
@@ -308,7 +317,7 @@ public final class ServerConfig {
                 // Consider the case where the specified service is decorated before being added.
                 final Service<?, ?> s = c.service();
                 @SuppressWarnings("rawtypes")
-                Optional<? extends Service> sOpt = s.as(serviceType);
+                final Optional<? extends Service> sOpt = s.as(serviceType);
                 if (!sOpt.isPresent()) {
                     continue;
                 }
@@ -343,6 +352,30 @@ public final class ServerConfig {
      */
     public boolean shutdownWorkerGroupOnStop() {
         return shutdownWorkerGroupOnStop;
+    }
+
+    /**
+     * Returns the {@link Executor} which will invoke the callbacks of {@link Server#start()},
+     * {@link Server#stop()} and {@link ServerListener}.
+     *
+     * <p>Note: Kept non-public since it doesn't seem useful for users.</p>
+     */
+    Executor startStopExecutor() {
+        return startStopExecutor;
+    }
+
+    /**
+     * Returns the {@link ChannelOption}s and their values of {@link Server}'s server sockets.
+     */
+    public Map<ChannelOption<?>, ?> channelOptions() {
+        return channelOptions;
+    }
+
+    /**
+     * Returns the {@link ChannelOption}s and their values of sockets accepted by {@link Server}.
+     */
+    public Map<ChannelOption<?>, ?> childChannelOptions() {
+        return childChannelOptions;
     }
 
     /**
@@ -440,8 +473,23 @@ public final class ServerConfig {
     /**
      * Returns an access log writer.
      */
-    public Consumer<RequestLog> accessLogWriter() {
+    public AccessLogWriter accessLogWriter() {
         return accessLogWriter;
+    }
+
+    /**
+     * Returns whether the {@link AccessLogWriter} is shut down when the {@link Server} stops.
+     */
+    public boolean shutdownAccessLogWriterOnStop() {
+        return shutdownAccessLogWriterOnStop;
+    }
+
+    /**
+     * Returns the maximum size of additional data (TLV, Tag-Length-Value). It is only used when
+     * PROXY protocol is enabled on the server port.
+     */
+    public int proxyProtocolMaxTlvSize() {
+        return proxyProtocolMaxTlvSize;
     }
 
     @Override
@@ -454,25 +502,29 @@ public final class ServerConfig {
                     maxNumConnections(), idleTimeoutMillis(),
                     defaultRequestTimeoutMillis(), defaultMaxRequestLength(),
                     defaultMaxHttp1InitialLineLength(), defaultMaxHttp1HeaderSize(), defaultMaxHttp1ChunkSize(),
-                    gracefulShutdownQuietPeriod(), gracefulShutdownTimeout(),
-                    blockingTaskExecutor(), meterRegistry(), serviceLoggerPrefix(), accessLogWriter());
+                    proxyProtocolMaxTlvSize(), gracefulShutdownQuietPeriod(), gracefulShutdownTimeout(),
+                    blockingTaskExecutor(), meterRegistry(), serviceLoggerPrefix(),
+                    accessLogWriter(), shutdownAccessLogWriterOnStop(),
+                    channelOptions(), childChannelOptions()
+            );
         }
 
         return strVal;
     }
 
     static String toString(
-            Class<?> type,
-            Iterable<ServerPort> ports, VirtualHost defaultVirtualHost, List<VirtualHost> virtualHosts,
+            @Nullable Class<?> type, Iterable<ServerPort> ports,
+            @Nullable VirtualHost defaultVirtualHost, List<VirtualHost> virtualHosts,
             EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnStop,
             int maxNumConnections, long idleTimeoutMillis, long defaultRequestTimeoutMillis,
             long defaultMaxRequestLength, long defaultMaxHttp1InitialLineLength,
-            long defaultMaxHttp1HeaderSize, long defaultMaxHttp1ChunkSize,
+            long defaultMaxHttp1HeaderSize, long defaultMaxHttp1ChunkSize, int proxyProtocolMaxTlvSize,
             Duration gracefulShutdownQuietPeriod, Duration gracefulShutdownTimeout,
-            Executor blockingTaskExecutor, MeterRegistry meterRegistry, String serviceLoggerPrefix,
-            Consumer<RequestLog> accessLogWriter) {
+            Executor blockingTaskExecutor, @Nullable MeterRegistry meterRegistry, String serviceLoggerPrefix,
+            AccessLogWriter accessLogWriter, boolean shutdownAccessLogWriterOnStop,
+            Map<ChannelOption<?>, ?> channelOptions, Map<ChannelOption<?>, ?> childChannelOptions) {
 
-        StringBuilder buf = new StringBuilder();
+        final StringBuilder buf = new StringBuilder();
         if (type != null) {
             buf.append(type.getSimpleName());
         }
@@ -480,8 +532,8 @@ public final class ServerConfig {
         buf.append("(ports: [");
 
         boolean hasPorts = false;
-        for (ServerPort p : ports) {
-            buf.append(ServerPort.toString(null, p.localAddress(), p.protocol()));
+        for (final ServerPort p : ports) {
+            buf.append(ServerPort.toString(null, p.localAddress(), p.protocols()));
             buf.append(", ");
             hasPorts = true;
         }
@@ -532,6 +584,8 @@ public final class ServerConfig {
         buf.append(defaultMaxHttp1HeaderSize);
         buf.append("B, defaultMaxHttp1ChunkSize: ");
         buf.append(defaultMaxHttp1ChunkSize);
+        buf.append("B, proxyProtocolMaxTlvSize: ");
+        buf.append(proxyProtocolMaxTlvSize);
         buf.append("B, gracefulShutdownQuietPeriod: ");
         buf.append(gracefulShutdownQuietPeriod);
         buf.append(", gracefulShutdownTimeout: ");
@@ -546,7 +600,13 @@ public final class ServerConfig {
         buf.append(serviceLoggerPrefix);
         buf.append(", accessLogWriter: ");
         buf.append(accessLogWriter);
+        buf.append(", shutdownAccessLogWriterOnStop: ");
+        buf.append(shutdownAccessLogWriterOnStop);
         buf.append(')');
+        buf.append(", channelOptions: ");
+        buf.append(channelOptions);
+        buf.append(", childChannelOptions: ");
+        buf.append(childChannelOptions);
 
         return buf.toString();
     }

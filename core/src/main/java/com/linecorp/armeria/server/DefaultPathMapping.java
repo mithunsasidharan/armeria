@@ -27,7 +27,8 @@ import java.util.StringJoiner;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import com.google.common.collect.ImmutableMap;
+import javax.annotation.Nullable;
+
 import com.google.common.collect.ImmutableSet;
 
 /**
@@ -41,6 +42,8 @@ import com.google.common.collect.ImmutableSet;
 final class DefaultPathMapping extends AbstractPathMapping {
 
     private static final Pattern VALID_PATTERN = Pattern.compile("(/[^/{}:]+|/:[^/{}]+|/\\{[^/{}]+})+/?");
+
+    private static final String[] EMPTY_NAMES = new String[0];
 
     /**
      * The original path pattern specified in the constructor.
@@ -122,7 +125,7 @@ final class DefaultPathMapping extends AbstractPathMapping {
         this.pathPattern = pathPattern;
         pattern = Pattern.compile(patternJoiner.toString());
         skeleton = Optional.of(skeletonJoiner.toString());
-        paramNameArray = paramNames.toArray(new String[paramNames.size()]);
+        paramNameArray = paramNames.toArray(EMPTY_NAMES);
         this.paramNames = ImmutableSet.copyOf(paramNames);
 
         loggerName = loggerName(pathPattern);
@@ -137,6 +140,7 @@ final class DefaultPathMapping extends AbstractPathMapping {
      *   <li>{@code "baz"} -> {@code null}</li>
      * </ul>
      */
+    @Nullable
     private static String paramName(String token) {
         if (token.startsWith("{") && token.endsWith("}")) {
             return token.substring(1, token.length() - 1);
@@ -187,11 +191,12 @@ final class DefaultPathMapping extends AbstractPathMapping {
             return PathMappingResult.of(mappingCtx.path(), mappingCtx.query());
         }
 
-        final ImmutableMap.Builder<String, String> pathParams = ImmutableMap.builder();
+        final PathMappingResultBuilder builder =
+                new PathMappingResultBuilder(mappingCtx.path(), mappingCtx.query());
         for (int i = 0; i < paramNameArray.length; i++) {
-            pathParams.put(paramNameArray[i], matcher.group(i + 1));
+            builder.rawParam(paramNameArray[i], matcher.group(i + 1));
         }
-        return PathMappingResult.of(mappingCtx.path(), mappingCtx.query(), pathParams.build());
+        return builder.build();
     }
 
     @Override
@@ -203,7 +208,7 @@ final class DefaultPathMapping extends AbstractPathMapping {
             return false;
         }
 
-        DefaultPathMapping that = (DefaultPathMapping) o;
+        final DefaultPathMapping that = (DefaultPathMapping) o;
 
         return skeleton.equals(that.skeleton) &&
                Arrays.equals(paramNameArray, that.paramNameArray);

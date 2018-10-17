@@ -16,7 +16,6 @@
 
 package com.linecorp.armeria.internal;
 
-import static org.apache.http.HttpVersion.HTTP;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
@@ -43,7 +42,6 @@ public class ConnectionLimitingHandlerIntegrationTest {
         @Override
         protected void configure(ServerBuilder sb) throws Exception {
             sb.workerGroup(EventLoopGroups.newEventLoopGroup(1), true);
-            sb.port(0, HTTP);
             sb.maxNumConnections(2);
             sb.serviceUnder("/", new AbstractHttpService() {});
         }
@@ -72,10 +70,10 @@ public class ConnectionLimitingHandlerIntegrationTest {
     }
 
     private static Socket newSocketAndTest() throws IOException {
-        Socket socket = new Socket(LOOPBACK, server.httpPort());
+        final Socket socket = new Socket(LOOPBACK, server.httpPort());
 
         // Test this socket is opened or not.
-        OutputStream os = socket.getOutputStream();
+        final OutputStream os = socket.getOutputStream();
         os.write("GET / HTTP/1.1\r\n\r\n".getBytes());
         os.flush();
 

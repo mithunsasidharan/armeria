@@ -48,7 +48,7 @@ public class DefaultStreamMessageVerification extends StreamMessageVerification<
         stream.onDemand(() -> {
             for (;;) {
                 final long r = remaining.decrementAndGet();
-                final boolean written = stream.write(elements - r);
+                final boolean written = stream.tryWrite(elements - r);
                 if (r == 0) {
                     if (abort) {
                         stream.abort();
@@ -68,7 +68,7 @@ public class DefaultStreamMessageVerification extends StreamMessageVerification<
 
     @Override
     public StreamMessage<Long> createFailedPublisher() {
-        DefaultStreamMessage<Long> stream = new DefaultStreamMessage<>();
+        final DefaultStreamMessage<Long> stream = new DefaultStreamMessage<>();
         stream.subscribe(new NoopSubscriber<>());
         return stream;
     }

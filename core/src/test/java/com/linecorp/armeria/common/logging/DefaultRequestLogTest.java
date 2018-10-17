@@ -18,6 +18,7 @@ package com.linecorp.armeria.common.logging;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.when;
 
 import org.junit.Before;
 import org.junit.Rule;
@@ -27,6 +28,8 @@ import org.mockito.junit.MockitoJUnit;
 import org.mockito.junit.MockitoRule;
 
 import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.HttpMethod;
+import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.SerializationFormat;
@@ -56,13 +59,26 @@ public class DefaultRequestLogTest {
 
     @Test
     public void endRequestSuccess() {
+        when(ctx.sessionProtocol()).thenReturn(SessionProtocol.H2C);
         log.endRequest();
         assertThat(log.requestDurationNanos()).isZero();
         assertThat(log.requestCause()).isNull();
     }
 
     @Test
+    public void endRequestWithoutHeaders() {
+        when(ctx.sessionProtocol()).thenReturn(SessionProtocol.H2C);
+        log.endRequest();
+        final HttpHeaders headers = log.requestHeaders();
+        assertThat(headers.scheme()).isEqualTo("http");
+        assertThat(headers.authority()).isEqualTo("?");
+        assertThat(headers.method()).isSameAs(HttpMethod.UNKNOWN);
+        assertThat(headers.path()).isEqualTo("?");
+    }
+
+    @Test
     public void endResponseSuccess() {
+        when(ctx.sessionProtocol()).thenReturn(SessionProtocol.H2C);
         log.endResponse();
         assertThat(log.responseDurationNanos()).isZero();
         assertThat(log.responseCause()).isNull();
@@ -70,15 +86,21 @@ public class DefaultRequestLogTest {
 
     @Test
     public void endResponseFailure() {
-        Throwable error = new Throwable("response failed");
+        final Throwable error = new Throwable("response failed");
         log.endResponse(error);
         assertThat(log.responseDurationNanos()).isZero();
         assertThat(log.responseCause()).isSameAs(error);
     }
 
     @Test
+    public void endResponseWithoutHeaders() {
+        log.endResponse();
+        assertThat(log.responseHeaders().status()).isEqualTo(HttpStatus.valueOf(0));
+    }
+
+    @Test
     public void rpcFailure_endResponseWithoutCause() {
-        Throwable error = new Throwable("response failed");
+        final Throwable error = new Throwable("response failed");
         log.responseContent(RpcResponse.ofFailure(error), null);
         // If user code doesn't call endResponse, the framework automatically does with no cause.
         log.endResponse();
@@ -88,8 +110,8 @@ public class DefaultRequestLogTest {
 
     @Test
     public void rpcFailure_endResponseDifferentCause() {
-        Throwable error = new Throwable("response failed one way");
-        Throwable error2 = new Throwable("response failed a different way?");
+        final Throwable error = new Throwable("response failed one way");
+        final Throwable error2 = new Throwable("response failed a different way?");
         log.responseContent(RpcResponse.ofFailure(error), null);
         log.endResponse(error2);
         assertThat(log.responseDurationNanos()).isZero();
@@ -100,11 +122,10 @@ public class DefaultRequestLogTest {
     public void addChild() {
         final DefaultRequestLog child = new DefaultRequestLog(ctx);
         log.addChild(child);
-        child.startRequest(channel, SessionProtocol.H2C, "/example.com");
+        child.startRequest(channel, SessionProtocol.H2C);
         assertThat(log.requestStartTimeMillis()).isEqualTo(child.requestStartTimeMillis());
         assertThat(log.channel()).isSameAs(channel);
         assertThat(log.sessionProtocol()).isSameAs(SessionProtocol.H2C);
-        assertThat(log.host()).isEqualTo("/example.com");
 
         child.serializationFormat(SerializationFormat.NONE);
         assertThat(log.serializationFormat()).isSameAs(SerializationFormat.NONE);

@@ -20,14 +20,17 @@ import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import javax.annotation.Nullable;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
 
-import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
+
+import io.netty.util.AsciiString;
 
 /**
  * Extracts {@link OAuth1aToken} from {@link HttpHeaders}, in order to be used by
@@ -39,28 +42,35 @@ final class OAuth1aTokenExtractor implements Function<HttpHeaders, OAuth1aToken>
     private static final Pattern AUTHORIZATION_HEADER_PATTERN = Pattern.compile(
             "\\s*(?i)oauth\\s+(?<parameters>\\S+)\\s*");
 
+    private final AsciiString header;
+
+    OAuth1aTokenExtractor(AsciiString header) {
+        this.header = header;
+    }
+
+    @Nullable
     @Override
     public OAuth1aToken apply(HttpHeaders headers) {
-        String authorization = headers.get(HttpHeaderNames.AUTHORIZATION);
+        final String authorization = headers.get(header);
         if (Strings.isNullOrEmpty(authorization)) {
             return null;
         }
 
-        Matcher matcher = AUTHORIZATION_HEADER_PATTERN.matcher(authorization);
+        final Matcher matcher = AUTHORIZATION_HEADER_PATTERN.matcher(authorization);
         if (!matcher.matches()) {
             logger.warn("Invalid authorization header: " + authorization);
             return null;
         }
 
-        ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
+        final ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
         for (String token : matcher.group("parameters").split(",")) {
-            int sep = token.indexOf('=');
+            final int sep = token.indexOf('=');
             if (sep == -1 || token.charAt(sep + 1) != '"' || token.charAt(token.length() - 1) != '"') {
                 logger.warn("Invalid token: " + token);
                 return null;
             }
-            String key = token.substring(0, sep);
-            String value = token.substring(sep + 2, token.length() - 1);
+            final String key = token.substring(0, sep);
+            final String value = token.substring(sep + 2, token.length() - 1);
             builder.put(key, value);
         }
 

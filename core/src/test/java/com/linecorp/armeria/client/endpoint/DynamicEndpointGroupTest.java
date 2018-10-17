@@ -29,24 +29,30 @@ public class DynamicEndpointGroupTest {
 
     @Test
     public void updateEndpoints() {
-        DynamicEndpointGroup endpointGroup = new DynamicEndpointGroup();
-        AtomicInteger updateListenerCalled = new AtomicInteger(0);
+        final DynamicEndpointGroup endpointGroup = new DynamicEndpointGroup();
+        final AtomicInteger updateListenerCalled = new AtomicInteger(0);
         endpointGroup.addListener(l -> updateListenerCalled.incrementAndGet());
 
         assertThat(updateListenerCalled.get()).isEqualTo(0);
+        endpointGroup.setEndpoints(ImmutableList.of(Endpoint.of("127.0.0.1", 3333),
+                                                    Endpoint.of("127.0.0.1", 1111)));
+        assertThat(endpointGroup.endpoints()).containsExactly(Endpoint.of("127.0.0.1", 1111),
+                                                              Endpoint.of("127.0.0.1", 3333));
+        assertThat(updateListenerCalled.get()).isEqualTo(1);
         endpointGroup.setEndpoints(ImmutableList.of(Endpoint.of("127.0.0.1", 1111),
-                                                    Endpoint.of("127.0.0.1", 2222)));
+                                                    Endpoint.of("127.0.0.1", 3333)));
+        // Same endpoints, nothing happens.
         assertThat(updateListenerCalled.get()).isEqualTo(1);
 
-        endpointGroup.addEndpoint(Endpoint.of("127.0.0.1", 3333));
+        endpointGroup.addEndpoint(Endpoint.of("127.0.0.1", 2222));
         assertThat(updateListenerCalled.get()).isEqualTo(2);
-        assertThat(endpointGroup.endpoints()).isEqualTo(ImmutableList.of(Endpoint.of("127.0.0.1", 1111),
-                                                                         Endpoint.of("127.0.0.1", 2222),
-                                                                         Endpoint.of("127.0.0.1", 3333)));
+        assertThat(endpointGroup.endpoints()).containsExactly(Endpoint.of("127.0.0.1", 1111),
+                                                              Endpoint.of("127.0.0.1", 2222),
+                                                              Endpoint.of("127.0.0.1", 3333));
 
         endpointGroup.removeEndpoint(Endpoint.of("127.0.0.1", 2222));
         assertThat(updateListenerCalled.get()).isEqualTo(3);
-        assertThat(endpointGroup.endpoints()).isEqualTo(ImmutableList.of(Endpoint.of("127.0.0.1", 1111),
-                                                                         Endpoint.of("127.0.0.1", 3333)));
+        assertThat(endpointGroup.endpoints()).containsExactly(Endpoint.of("127.0.0.1", 1111),
+                                                              Endpoint.of("127.0.0.1", 3333));
     }
 }

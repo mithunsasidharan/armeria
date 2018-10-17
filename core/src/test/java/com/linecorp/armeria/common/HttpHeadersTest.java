@@ -16,11 +16,14 @@
 
 package com.linecorp.armeria.common;
 
+import static com.linecorp.armeria.common.HttpHeaderNames.CONTENT_TYPE;
+import static com.linecorp.armeria.common.MediaType.ANY_APPLICATION_TYPE;
+import static com.linecorp.armeria.common.MediaType.ANY_AUDIO_TYPE;
+import static com.linecorp.armeria.common.MediaType.ANY_TEXT_TYPE;
+import static com.linecorp.armeria.common.MediaType.ANY_TYPE;
 import static io.netty.util.AsciiString.of;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.hamcrest.Matchers.containsInAnyOrder;
-import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertThat;
 
 import org.junit.Test;
 
@@ -34,11 +37,12 @@ public class HttpHeadersTest {
                                                    of("HEADER2"), "value2",
                                                    of("Header3"), "VALUE3");
 
-        assertThat(headers.get(of("HeAdEr1")), is("value1"));
-        assertThat(headers.get(of("header2")), is("value2"));
-        assertThat(headers.get(of("HEADER3")), is("VALUE3"));
+        assertThat(headers.get(of("HeAdEr1"))).isEqualTo("value1");
+        assertThat(headers.get(of("header2"))).isEqualTo("value2");
+        assertThat(headers.get(of("HEADER3"))).isEqualTo("VALUE3");
 
-        assertThat(headers.names(), containsInAnyOrder(of("header1"), of("header2"), of("header3")));
+        assertThat(headers.names())
+                .containsExactlyInAnyOrder(of("header1"), of("header2"), of("header3"));
     }
 
     @Test
@@ -46,7 +50,28 @@ public class HttpHeadersTest {
         assertThatThrownBy(() -> HttpHeaders.of((AsciiString) null, "value1"))
                 .isInstanceOf(IllegalArgumentException.class);
 
-        assertThatThrownBy(() -> HttpHeaders.of(AsciiString.of(""), "value1"))
+        assertThatThrownBy(() -> HttpHeaders.of(of(""), "value1"))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void contentType() {
+        final HttpHeaders headers = HttpHeaders.of();
+
+        headers.contentType(ANY_TYPE);
+        assertThat(headers.contentType()).isSameAs(ANY_TYPE);
+        assertThat(headers.get(CONTENT_TYPE)).isEqualTo(ANY_TYPE.toString());
+
+        headers.contentType(ANY_APPLICATION_TYPE);
+        assertThat(headers.contentType()).isSameAs(ANY_APPLICATION_TYPE);
+        assertThat(headers.get(CONTENT_TYPE)).isEqualTo(ANY_APPLICATION_TYPE.toString());
+
+        headers.setObject(CONTENT_TYPE, ANY_TEXT_TYPE);
+        assertThat(headers.contentType()).isSameAs(ANY_TEXT_TYPE);
+        assertThat(headers.get(CONTENT_TYPE)).isEqualTo(ANY_TEXT_TYPE.toString());
+
+        headers.set(CONTENT_TYPE, ANY_AUDIO_TYPE.toString());
+        assertThat(headers.contentType()).isSameAs(ANY_AUDIO_TYPE);
+        assertThat(headers.get(CONTENT_TYPE)).isEqualTo(ANY_AUDIO_TYPE.toString());
     }
 }

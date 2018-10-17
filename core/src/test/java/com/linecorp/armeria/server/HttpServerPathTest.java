@@ -32,7 +32,6 @@ import com.google.common.io.ByteStreams;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
-import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.testing.server.ServerRule;
 
 import io.netty.util.NetUtil;
@@ -43,7 +42,6 @@ public class HttpServerPathTest {
     public static final ServerRule server = new ServerRule() {
         @Override
         protected void configure(ServerBuilder sb) throws Exception {
-            sb.port(0, SessionProtocol.HTTP);
             sb.service("/service/foo", new AbstractHttpService() {
                 @Override
                 protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) {
@@ -85,6 +83,11 @@ public class HttpServerPathTest {
         // Should allow the asterisk character in the path
         TEST_URLS.put("/service/foo*bar4", HttpStatus.OK);
 
+        // OK as long as double dots are not used as a 'parent directory'
+        TEST_URLS.put("/..service/foobar1", HttpStatus.OK);
+        TEST_URLS.put("/service../foobar2", HttpStatus.OK);
+        TEST_URLS.put("/service/foobar3..", HttpStatus.OK);
+
         // 400 test
         TEST_URLS.put("..", HttpStatus.BAD_REQUEST);
         TEST_URLS.put(".\\", HttpStatus.BAD_REQUEST);
@@ -96,9 +99,6 @@ public class HttpServerPathTest {
         TEST_URLS.put("/service/foo<bar", HttpStatus.BAD_REQUEST);
 
         // 404 test
-        TEST_URLS.put("/..service/foobar1", HttpStatus.NOT_FOUND);
-        TEST_URLS.put("/service../foobar2", HttpStatus.NOT_FOUND);
-        TEST_URLS.put("/service/foobar3..", HttpStatus.NOT_FOUND);
         TEST_URLS.put("/gwturl#user:45/comments", HttpStatus.NOT_FOUND);
         TEST_URLS.put("/service:name/hello", HttpStatus.NOT_FOUND);
         TEST_URLS.put("/service::::name/hello", HttpStatus.NOT_FOUND);

@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -56,6 +57,7 @@ import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.thrift.ThriftCompletableFuture;
 import com.linecorp.armeria.common.tracing.HelloService;
 import com.linecorp.armeria.common.tracing.HelloService.AsyncIface;
+import com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.ServerBuilder;
 import com.linecorp.armeria.server.Service;
@@ -64,8 +66,11 @@ import com.linecorp.armeria.server.thrift.THttpService;
 import com.linecorp.armeria.server.tracing.HttpTracingService;
 import com.linecorp.armeria.testing.server.ServerRule;
 
+import brave.ScopedSpan;
+import brave.Tracer.SpanInScope;
 import brave.Tracing;
 import brave.propagation.CurrentTraceContext;
+import brave.propagation.StrictScopeDecorator;
 import brave.sampler.Sampler;
 import zipkin2.Span;
 import zipkin2.reporter.Reporter;
@@ -99,13 +104,13 @@ public class HttpTracingIntegrationTest {
 
             sb.service("/zip", decorate("service/zip", THttpService.of(
                     (AsyncIface) (name, resultHandler) -> {
-                        ThriftCompletableFuture<String> f1 = new ThriftCompletableFuture<>();
-                        ThriftCompletableFuture<String> f2 = new ThriftCompletableFuture<>();
+                        final ThriftCompletableFuture<String> f1 = new ThriftCompletableFuture<>();
+                        final ThriftCompletableFuture<String> f2 = new ThriftCompletableFuture<>();
                         quxClient.hello(name, f1);
                         quxClient.hello(name, f2);
-                        CompletableFuture.allOf(f1, f2).whenComplete((aVoid, throwable) -> {
+                        CompletableFuture.allOf(f1, f2).whenCompleteAsync((aVoid, throwable) -> {
                             resultHandler.onComplete(f1.join() + ", and " + f2.join());
-                        });
+                        }, RequestContext.current().contextAwareExecutor());
                     })));
 
             sb.service("/qux", decorate("service/qux", THttpService.of(
@@ -115,39 +120,51 @@ public class HttpTracingIntegrationTest {
                 @Override
                 protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req)
                         throws Exception {
-                    ListeningExecutorService executorService = MoreExecutors.listeningDecorator(
+                    final ListeningExecutorService executorService = MoreExecutors.listeningDecorator(
                             Executors.newFixedThreadPool(2));
-                    CountDownLatch countDownLatch = new CountDownLatch(2);
+                    final CountDownLatch countDownLatch = new CountDownLatch(2);
 
-                    ListenableFuture<List<Object>> spanAware = allAsList(IntStream.range(1, 3).mapToObj(
+                    final ListenableFuture<List<Object>> spanAware = allAsList(IntStream.range(1, 3).mapToObj(
                             i -> executorService.submit(
                                     RequestContext.current().makeContextAware(() -> {
+                                        if (i == 2) {
+                                            countDownLatch.countDown();
+                                            countDownLatch.await();
+                                        }
                                         brave.Span span = Tracing.currentTracer().nextSpan().start();
-                                        countDownLatch.countDown();
-                                        countDownLatch.await();
-                                        try {
-                                            return null;
+                                        try (SpanInScope spanInScope =
+                                                     Tracing.currentTracer().withSpanInScope(span)) {
+                                            if (i == 1) {
+                                                countDownLatch.countDown();
+                                                countDownLatch.await();
+                                                // to wait second task get span.
+                                                Thread.sleep(1000L);
+                                            }
                                         } finally {
                                             span.finish();
                                         }
+                                        return null;
                                     }))).collect(toImmutableList()));
 
-                    CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
-                    HttpResponse res = HttpResponse.from(responseFuture);
+                    final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
+                    final HttpResponse res = HttpResponse.from(responseFuture);
                     transformAsync(spanAware,
                                    result -> allAsList(IntStream.range(1, 3).mapToObj(
-                                           i -> executorService.submit(() -> {
-                                               brave.Span span = Tracing.currentTracer().nextSpan().start();
-                                               try {
-                                                   return null;
-                                               } finally {
-                                                   span.finish();
-                                               }
-                                           })).collect(toImmutableList())),
-                                   RequestContext.current().eventLoop())
+                                           i -> executorService.submit(
+                                                   RequestContext.current().makeContextAware(() -> {
+                                                       ScopedSpan span = Tracing.currentTracer()
+                                                                                .startScopedSpan("aloha");
+                                                       try {
+                                                           return null;
+                                                       } finally {
+                                                           span.finish();
+                                                       }
+                                                   })
+                                           )).collect(toImmutableList())),
+                                   RequestContext.current().contextAwareExecutor())
                             .addListener(() -> {
                                 responseFuture.complete(HttpResponse.of(OK, MediaType.PLAIN_TEXT_UTF_8, "Lee"));
-                            }, RequestContext.current().eventLoop());
+                            }, RequestContext.current().contextAwareExecutor());
                     return res;
                 }
             }));
@@ -192,8 +209,12 @@ public class HttpTracingIntegrationTest {
     }
 
     private static Tracing newTracing(String name) {
+        final CurrentTraceContext currentTraceContext =
+                RequestContextCurrentTraceContext.newBuilder()
+                                                 .addScopeDecorator(StrictScopeDecorator.create())
+                                                 .build();
         return Tracing.newBuilder()
-                      .currentTraceContext(CurrentTraceContext.Default.create())
+                      .currentTraceContext(currentTraceContext)
                       .localServiceName(name)
                       .spanReporter(spanReporter)
                       .sampler(Sampler.ALWAYS_SAMPLE)
@@ -301,8 +322,11 @@ public class HttpTracingIntegrationTest {
     @Test(timeout = 10000)
     public void testSpanInThreadPoolHasSameTraceId() throws Exception {
         poolHttpClient.get("pool").aggregate().get();
-        Span[] spans = spanReporter.take(5);
-        assertThat(Arrays.stream(spans).map(span -> span.traceId()).collect(toImmutableSet())).hasSize(3);
+        final Span[] spans = spanReporter.take(5);
+        assertThat(Arrays.stream(spans).map(Span::traceId).collect(toImmutableSet())).hasSize(1);
+        assertThat(Arrays.stream(spans).map(Span::parentId)
+                         .filter(Objects::nonNull)
+                         .collect(toImmutableSet())).hasSize(1);
     }
 
     private static Span findSpan(Span[] spans, String serviceName) {

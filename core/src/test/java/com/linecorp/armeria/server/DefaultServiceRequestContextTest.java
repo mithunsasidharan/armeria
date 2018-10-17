@@ -22,8 +22,8 @@ import static org.mockito.Mockito.mock;
 import org.junit.Test;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 
+import com.linecorp.armeria.common.DefaultHttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
@@ -33,6 +33,7 @@ import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.metric.NoopMeterRegistry;
 
 import io.netty.channel.Channel;
+import io.netty.util.AsciiString;
 import io.netty.util.AttributeKey;
 
 public class DefaultServiceRequestContextTest {
@@ -47,12 +48,15 @@ public class DefaultServiceRequestContextTest {
         final ServiceRequestContext originalCtx = new DefaultServiceRequestContext(
                 virtualHost.serviceConfigs().get(0), mock(Channel.class), NoopMeterRegistry.get(),
                 SessionProtocol.H2,
-                mappingCtx, PathMappingResult.of("/foo", null, ImmutableMap.of()), mock(Request.class), null);
+                mappingCtx, PathMappingResult.of("/foo"),
+                mock(Request.class), null, null);
+
+        setAdditionalHeaders(originalCtx);
 
         final AttributeKey<String> foo = AttributeKey.valueOf(DefaultServiceRequestContextTest.class, "foo");
         originalCtx.attr(foo).set("foo");
 
-        Request newRequest = mock(Request.class);
+        final Request newRequest = mock(Request.class);
         final ServiceRequestContext derivedCtx = originalCtx.newDerivedContext(newRequest);
         assertThat(derivedCtx.server()).isSameAs(originalCtx.server());
         assertThat(derivedCtx.sessionProtocol()).isSameAs(originalCtx.sessionProtocol());
@@ -63,6 +67,13 @@ public class DefaultServiceRequestContextTest {
         assertThat(derivedCtx.path()).isEqualTo(originalCtx.path());
         assertThat(derivedCtx.maxRequestLength()).isEqualTo(originalCtx.maxRequestLength());
         assertThat(derivedCtx.requestTimeoutMillis()).isEqualTo(originalCtx.requestTimeoutMillis());
+        assertThat(derivedCtx.additionalResponseHeaders().get(AsciiString.of("my-header#1"))).isNull();
+        assertThat(derivedCtx.additionalResponseHeaders().get(AsciiString.of("my-header#2")))
+                .isEqualTo("value#2");
+        assertThat(derivedCtx.additionalResponseHeaders().get(AsciiString.of("my-header#3")))
+                .isEqualTo("value#3");
+        assertThat(derivedCtx.additionalResponseHeaders().get(AsciiString.of("my-header#4")))
+                .isEqualTo("value#4");
         // the attribute is derived as well
         assertThat(derivedCtx.attr(foo).get()).isEqualTo("foo");
 
@@ -82,5 +93,19 @@ public class DefaultServiceRequestContextTest {
                                                  .serviceUnder("/", service)
                                                  .and().build();
         return server.config().findVirtualHost("example.com");
+    }
+
+    private static void setAdditionalHeaders(ServiceRequestContext originalCtx) {
+        final DefaultHttpHeaders headers1 = new DefaultHttpHeaders();
+        headers1.set(AsciiString.of("my-header#1"), "value#1");
+        originalCtx.setAdditionalResponseHeaders(headers1);
+        originalCtx.setAdditionalResponseHeader(AsciiString.of("my-header#2"), "value#2");
+
+        final DefaultHttpHeaders headers2 = new DefaultHttpHeaders();
+        headers2.set(AsciiString.of("my-header#3"), "value#3");
+        originalCtx.addAdditionalResponseHeaders(headers2);
+        originalCtx.addAdditionalResponseHeader(AsciiString.of("my-header#4"), "value#4");
+        // Remove the first one.
+        originalCtx.removeAdditionalResponseHeader(AsciiString.of("my-header#1"));
     }
 }

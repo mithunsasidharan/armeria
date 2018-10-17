@@ -23,14 +23,16 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 
+import javax.annotation.Nullable;
+
 import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.Request;
-import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.metric.MeterIdPrefix;
 import com.linecorp.armeria.common.util.SafeCloseable;
+import com.linecorp.armeria.internal.ArmeriaHttpUtil;
 import com.linecorp.armeria.server.HttpStatusException;
 import com.linecorp.armeria.server.PathMapped;
 import com.linecorp.armeria.server.PathMapping;
@@ -68,7 +70,9 @@ import io.micrometer.core.instrument.MeterRegistry;
 public abstract class AbstractCompositeService<I extends Request, O extends Response> implements Service<I, O> {
 
     private final List<CompositeServiceEntry<I, O>> services;
+    @Nullable
     private Server server;
+    @Nullable
     private Router<Service<I, O>> router;
 
     /**
@@ -131,6 +135,7 @@ public abstract class AbstractCompositeService<I extends Request, O extends Resp
      *         {@link PathMapped#empty()} if there's no match.
      */
     protected PathMapped<Service<I, O>> findService(PathMappingContext mappingCtx) {
+        assert router != null;
         return router.find(mappingCtx);
     }
 
@@ -149,7 +154,7 @@ public abstract class AbstractCompositeService<I extends Request, O extends Resp
 
             final ServiceRequestContext newCtx = new CompositeServiceRequestContext(
                     ctx, newMapping, mapped.mappingResult().path());
-            try (SafeCloseable ignored = RequestContext.push(newCtx, false)) {
+            try (SafeCloseable ignored = newCtx.push(false)) {
                 return mapped.value().serve(newCtx, req);
             }
         } else {
@@ -161,6 +166,8 @@ public abstract class AbstractCompositeService<I extends Request, O extends Resp
 
         private final PathMapping pathMapping;
         private final String mappedPath;
+        @Nullable
+        private String decodedMappedPath;
 
         CompositeServiceRequestContext(ServiceRequestContext delegate, PathMapping pathMapping,
                                        String mappedPath) {
@@ -191,6 +198,16 @@ public abstract class AbstractCompositeService<I extends Request, O extends Resp
         @Override
         public String mappedPath() {
             return mappedPath;
+        }
+
+        @Override
+        public String decodedMappedPath() {
+            final String decodedMappedPath = this.decodedMappedPath;
+            if (decodedMappedPath != null) {
+                return decodedMappedPath;
+            }
+
+            return this.decodedMappedPath = ArmeriaHttpUtil.decodePath(mappedPath);
         }
     }
 }

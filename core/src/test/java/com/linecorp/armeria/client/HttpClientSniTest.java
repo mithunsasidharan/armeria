@@ -16,7 +16,6 @@
 
 package com.linecorp.armeria.client;
 
-import static com.linecorp.armeria.common.SessionProtocol.HTTPS;
 import static org.junit.Assert.assertEquals;
 
 import java.net.InetAddress;
@@ -33,13 +32,18 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.linecorp.armeria.common.AggregatedHttpMessage;
+import com.linecorp.armeria.common.HttpHeaderNames;
+import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.common.util.SafeCloseable;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.Server;
 import com.linecorp.armeria.server.ServerBuilder;
+import com.linecorp.armeria.server.ServerPort;
 import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.VirtualHostBuilder;
 
@@ -68,16 +72,14 @@ public class HttpClientSniTest {
             sscA = new SelfSignedCertificate("a.com");
             sscB = new SelfSignedCertificate("b.com");
 
-            sb.port(0, HTTPS);
-
             final VirtualHostBuilder a = new VirtualHostBuilder("a.com");
             final VirtualHostBuilder b = new VirtualHostBuilder("b.com");
 
             a.service("/", new SniTestService("a.com"));
             b.service("/", new SniTestService("b.com"));
 
-            a.sslContext(HTTPS, sscA.certificate(), sscA.privateKey());
-            b.sslContext(HTTPS, sscB.certificate(), sscB.privateKey());
+            a.tls(sscA.certificate(), sscA.privateKey());
+            b.tls(sscB.certificate(), sscB.privateKey());
 
             sb.virtualHost(a.build());
             sb.defaultVirtualHost(b.build());
@@ -91,7 +93,7 @@ public class HttpClientSniTest {
     public static void init() throws Exception {
         server.start().get();
         httpsPort = server.activePorts().values().stream()
-                          .filter(p -> p.protocol() == HTTPS).findAny().get().localAddress()
+                          .filter(ServerPort::hasHttps).findAny().get().localAddress()
                           .getPort();
         clientFactory = new ClientFactoryBuilder()
                 .sslContextCustomizer(b -> b.trustManager(InsecureTrustManagerFactory.INSTANCE))
@@ -132,10 +134,32 @@ public class HttpClientSniTest {
     private static String get(String fqdn) throws Exception {
         final HttpClient client = HttpClient.of(clientFactory, "https://" + fqdn + ':' + httpsPort);
 
-        AggregatedHttpMessage response = client.get("/").aggregate().get();
+        final AggregatedHttpMessage response = client.get("/").aggregate().get();
 
         assertEquals(HttpStatus.OK, response.headers().status());
         return response.content().toString(StandardCharsets.UTF_8);
+    }
+
+    @Test
+    public void testCustomAuthority() throws Exception {
+        final HttpClient client = HttpClient.of(clientFactory, "https://127.0.0.1:" + httpsPort);
+        final AggregatedHttpMessage response =
+                client.execute(HttpHeaders.of(HttpMethod.GET, "/")
+                                          .set(HttpHeaderNames.AUTHORITY, "a.com:" + httpsPort))
+                      .aggregate().get();
+
+        assertEquals(HttpStatus.OK, response.headers().status());
+        assertEquals("a.com: CN=a.com", response.content().toStringUtf8());
+    }
+
+    @Test
+    public void testCustomAuthorityWithAdditionalHeaders() throws Exception {
+        final HttpClient client = HttpClient.of(clientFactory, "https://127.0.0.1:" + httpsPort);
+        try (SafeCloseable unused = Clients.withHttpHeader(HttpHeaderNames.AUTHORITY, "a.com:" + httpsPort)) {
+            final AggregatedHttpMessage response = client.get("/").aggregate().get();
+            assertEquals(HttpStatus.OK, response.headers().status());
+            assertEquals("a.com: CN=a.com", response.content().toStringUtf8());
+        }
     }
 
     private static class DummyAddressResolverGroup extends AddressResolverGroup<InetSocketAddress> {

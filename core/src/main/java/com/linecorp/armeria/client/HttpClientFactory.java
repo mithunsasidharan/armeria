@@ -97,7 +97,7 @@ final class HttpClientFactory extends AbstractClientFactory {
 
     HttpClientFactory(
             EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnClose,
-            Map<ChannelOption<?>, Object> socketOptions,
+            Map<ChannelOption<?>, Object> channelOptions,
             Consumer<? super SslContextBuilder> sslContextCustomizer,
             Function<? super EventLoopGroup,
                     ? extends AddressResolverGroup<? extends InetSocketAddress>> addressResolverGroupFactory,
@@ -106,11 +106,15 @@ final class HttpClientFactory extends AbstractClientFactory {
             long idleTimeoutMillis, boolean useHttp2Preface, boolean useHttp1Pipelining,
             KeyedChannelPoolHandler<? super PoolKey> connectionPoolListener, MeterRegistry meterRegistry) {
 
+        @SuppressWarnings("unchecked")
+        final AddressResolverGroup<InetSocketAddress> addressResolverGroup =
+                (AddressResolverGroup<InetSocketAddress>) addressResolverGroupFactory.apply(workerGroup);
+
         final Bootstrap baseBootstrap = new Bootstrap();
         baseBootstrap.channel(TransportType.socketChannelType(workerGroup));
-        baseBootstrap.resolver(addressResolverGroupFactory.apply(workerGroup));
+        baseBootstrap.resolver(addressResolverGroup);
 
-        socketOptions.forEach((option, value) -> {
+        channelOptions.forEach((option, value) -> {
             @SuppressWarnings("unchecked")
             final ChannelOption<Object> castOption = (ChannelOption<Object>) option;
             baseBootstrap.option(castOption, value);
@@ -132,7 +136,7 @@ final class HttpClientFactory extends AbstractClientFactory {
         this.connectionPoolListener = new ConnectionPoolListenerImpl(connectionPoolListener);
         this.meterRegistry = meterRegistry;
 
-        clientDelegate = new HttpClientDelegate(this);
+        clientDelegate = new HttpClientDelegate(this, addressResolverGroup);
         eventLoopScheduler = new EventLoopScheduler(workerGroup);
     }
 
@@ -239,7 +243,7 @@ final class HttpClientFactory extends AbstractClientFactory {
             final HttpClient client = newHttpClient(uri, scheme, endpoint, options, delegate);
 
             @SuppressWarnings("unchecked")
-            T castClient = (T) client;
+            final T castClient = (T) client;
             return castClient;
         } else {
             throw new IllegalArgumentException("unsupported client type: " + clientType.getName());
@@ -271,7 +275,7 @@ final class HttpClientFactory extends AbstractClientFactory {
     public void close() {
         connectionPoolListener.setClosed();
 
-        for (Iterator<KeyedChannelPool<PoolKey>> i = pools.values().iterator(); i.hasNext();) {
+        for (final Iterator<KeyedChannelPool<PoolKey>> i = pools.values().iterator(); i.hasNext();) {
             i.next().close();
             i.remove();
         }
@@ -282,13 +286,13 @@ final class HttpClientFactory extends AbstractClientFactory {
     }
 
     KeyedChannelPool<PoolKey> pool(EventLoop eventLoop) {
-        KeyedChannelPool<PoolKey> pool = pools.get(eventLoop);
+        final KeyedChannelPool<PoolKey> pool = pools.get(eventLoop);
         if (pool != null) {
             return pool;
         }
 
         return pools.computeIfAbsent(eventLoop, e -> {
-            Function<PoolKey, Future<Channel>> channelFactory =
+            final Function<PoolKey, Future<Channel>> channelFactory =
                     new HttpSessionChannelFactory(this, eventLoop);
 
             @SuppressWarnings("unchecked")

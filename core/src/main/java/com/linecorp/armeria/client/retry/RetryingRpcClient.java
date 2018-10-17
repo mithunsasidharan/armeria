@@ -15,9 +15,8 @@
  */
 package com.linecorp.armeria.client.retry;
 
-import static com.linecorp.armeria.common.util.Functions.voidFunction;
-
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
 import com.linecorp.armeria.client.Client;
@@ -26,8 +25,6 @@ import com.linecorp.armeria.client.ResponseTimeoutException;
 import com.linecorp.armeria.common.DefaultRpcResponse;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
-
-import io.netty.channel.EventLoop;
 
 /**
  * A {@link Client} decorator that handles failures of an invocation and retries RPC requests.
@@ -83,53 +80,50 @@ public final class RetryingRpcClient extends RetryingClient<RpcRequest, RpcRespo
 
     @Override
     protected RpcResponse doExecute(ClientRequestContext ctx, RpcRequest req) throws Exception {
-        final DefaultRpcResponse responseFuture = new DefaultRpcResponse();
-        doExecute0(ctx, req, responseFuture);
-        return responseFuture;
+        final CompletableFuture<RpcResponse> future = new CompletableFuture<>();
+        final RpcResponse res = RpcResponse.from(future);
+        doExecute0(ctx, req, res, future);
+        return res;
     }
 
-    private void doExecute0(ClientRequestContext ctx, RpcRequest req, DefaultRpcResponse responseFuture) {
+    private void doExecute0(ClientRequestContext ctx, RpcRequest req,
+                            RpcResponse returnedRes, CompletableFuture<RpcResponse> future) {
+        if (returnedRes.isDone()) {
+            // The response has been cancelled by the client before it receives a response, so stop retrying.
+            handleException(ctx, future, new CancellationException(
+                    "the response returned to the client has been cancelled"));
+            return;
+        }
         if (!setResponseTimeout(ctx)) {
-            completeOnException(ctx, responseFuture, ResponseTimeoutException.get());
+            handleException(ctx, future, ResponseTimeoutException.get());
             return;
         }
 
-        final RpcResponse response = getResponse(ctx, req);
-
-        retryStrategy().shouldRetry(req, response).handle(voidFunction((backoffOpt, unused) -> {
-            if (backoffOpt.isPresent()) {
-                long nextDelay;
-                try {
-                    nextDelay = getNextDelay(ctx, backoffOpt.get());
-                } catch (Exception e) {
-                    completeOnException(ctx, responseFuture, e);
-                    return;
-                }
-
-                EventLoop eventLoop = ctx.contextAwareEventLoop();
-                if (nextDelay <= 0) {
-                    eventLoop.execute(() -> doExecute0(ctx, req, responseFuture));
-                } else {
-                    eventLoop.schedule(() -> doExecute0(ctx, req, responseFuture),
-                                       nextDelay, TimeUnit.MILLISECONDS);
-                }
-            } else {
-                response.handle(voidFunction((result, thrown) -> {
-                    if (thrown != null) {
-                        completeOnException(ctx, responseFuture, thrown);
-                    } else {
+        final RpcResponse res = getResponse(ctx, req);
+        res.whenComplete((unused1, unused2) -> {
+            retryStrategy().shouldRetry(req, res).whenComplete((backoff, unused3) -> {
+                if (backoff != null) {
+                    final long nextDelay = getNextDelay(ctx, backoff);
+                    if (nextDelay < 0) {
                         onRetryingComplete(ctx);
-                        responseFuture.complete(result);
+                        future.complete(res);
+                        return;
                     }
-                }));
-            }
-        }));
+
+                    scheduleNextRetry(ctx, cause -> handleException(ctx, future, cause),
+                                      () -> doExecute0(ctx, req, returnedRes, future), nextDelay);
+                } else {
+                    onRetryingComplete(ctx);
+                    future.complete(res);
+                }
+            });
+        });
     }
 
-    private void completeOnException(ClientRequestContext ctx, DefaultRpcResponse responseFuture,
-                                     Throwable thrown) {
+    private static void handleException(ClientRequestContext ctx, CompletableFuture<RpcResponse> future,
+                                        Throwable cause) {
         onRetryingComplete(ctx);
-        responseFuture.completeExceptionally(thrown);
+        future.completeExceptionally(cause);
     }
 
     private RpcResponse getResponse(ClientRequestContext ctx, RpcRequest req) {

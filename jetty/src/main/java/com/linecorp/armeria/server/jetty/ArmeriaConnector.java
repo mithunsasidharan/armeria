@@ -22,6 +22,8 @@ import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
 
+import javax.annotation.Nullable;
+
 import org.eclipse.jetty.io.ArrayByteBufferPool;
 import org.eclipse.jetty.io.ByteBufferPool;
 import org.eclipse.jetty.io.Connection;
@@ -48,6 +50,8 @@ final class ArmeriaConnector extends ContainerLifeCycle implements Connector {
     private final ByteBufferPool byteBufferPool;
     private final ArmeriaConnectionFactory connectionFactory;
     private final Collection<ConnectionFactory> connectionFactories;
+
+    private volatile boolean isShutdown;
 
     ArmeriaConnector(Server server) {
         this.server = server;
@@ -102,11 +106,13 @@ final class ArmeriaConnector extends ContainerLifeCycle implements Connector {
         return byteBufferPool;
     }
 
+    @Nullable
     @Override
     public ConnectionFactory getConnectionFactory(String nextProtocol) {
         return PROTOCOL_NAME.equals(nextProtocol) ? connectionFactory : null;
     }
 
+    @Nullable
     @Override
     @SuppressWarnings("unchecked")
     public <T> T getConnectionFactory(Class<T> factoryType) {
@@ -145,7 +151,13 @@ final class ArmeriaConnector extends ContainerLifeCycle implements Connector {
 
     @Override
     public Future<Void> shutdown() {
+        isShutdown = true;
         return GlobalEventExecutor.INSTANCE.newSucceededFuture(null);
+    }
+
+    @Override
+    public boolean isShutdown() {
+        return isShutdown;
     }
 
     private static final class ArmeriaConnectionFactory implements ConnectionFactory {

@@ -25,6 +25,8 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.BiFunction;
 import java.util.regex.Pattern;
 
+import javax.annotation.Nullable;
+
 import com.linecorp.armeria.client.ClientFactory;
 import com.linecorp.armeria.client.ClientOptionsBuilder;
 import com.linecorp.armeria.client.HttpClient;
@@ -37,6 +39,7 @@ import com.linecorp.armeria.common.util.Exceptions;
 import okhttp3.Call;
 import okhttp3.Call.Factory;
 import okhttp3.Callback;
+import okhttp3.Headers;
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.Request;
@@ -56,13 +59,16 @@ final class ArmeriaCallFactory implements Factory {
     private final ClientFactory clientFactory;
     private final BiFunction<String, ? super ClientOptionsBuilder, ClientOptionsBuilder> configurator;
     private final String baseAuthority;
+    private final SubscriberFactory subscriberFactory;
 
     ArmeriaCallFactory(HttpClient baseHttpClient,
                        ClientFactory clientFactory,
-                       BiFunction<String, ? super ClientOptionsBuilder, ClientOptionsBuilder> configurator) {
+                       BiFunction<String, ? super ClientOptionsBuilder, ClientOptionsBuilder> configurator,
+                       SubscriberFactory subscriberFactory) {
         this.baseHttpClient = baseHttpClient;
         this.clientFactory = clientFactory;
         this.configurator = configurator;
+        this.subscriberFactory = subscriberFactory;
         baseAuthority = baseHttpClient.uri().getAuthority();
         httpClients.put(baseAuthority, baseHttpClient);
     }
@@ -103,6 +109,7 @@ final class ArmeriaCallFactory implements Factory {
 
         private final Request request;
 
+        @Nullable
         private volatile HttpResponse httpResponse;
 
         @SuppressWarnings("FieldMayBeFinal")
@@ -114,14 +121,15 @@ final class ArmeriaCallFactory implements Factory {
         }
 
         private static HttpResponse doCall(ArmeriaCallFactory callFactory, Request request) {
-            HttpUrl httpUrl = request.url();
-            URI uri = httpUrl.uri();
-            HttpClient httpClient = callFactory.getHttpClient(uri.getAuthority(), uri.getScheme());
-            StringBuilder uriBuilder = new StringBuilder(httpUrl.encodedPath());
-            if (uri.getQuery() != null) {
-                uriBuilder.append('?').append(httpUrl.encodedQuery());
+            final HttpUrl httpUrl = request.url();
+            final URI uri = httpUrl.uri();
+            final HttpClient httpClient = callFactory.getHttpClient(uri.getAuthority(), uri.getScheme());
+            final String uriString;
+            if (uri.getQuery() == null) {
+                uriString = httpUrl.encodedPath();
+            } else {
+                uriString = httpUrl.encodedPath() + '?' + httpUrl.encodedQuery();
             }
-            final String uriString = uriBuilder.toString();
             final HttpHeaders headers;
             switch (request.method()) {
                 case "GET":
@@ -148,8 +156,12 @@ final class ArmeriaCallFactory implements Factory {
                 default:
                     throw new IllegalArgumentException("Invalid HTTP method:" + request.method());
             }
-            request.headers().toMultimap().forEach(
-                    (key, values) -> headers.add(HttpHeaderNames.of(key), values));
+            final Headers requestHeaders = request.headers();
+            final int numHeaders = requestHeaders.size();
+            for (int i = 0; i < numHeaders; i++) {
+                headers.add(HttpHeaderNames.of(requestHeaders.name(i)),
+                            requestHeaders.value(i));
+            }
             final RequestBody body = request.body();
             if (body != null) {
                 final MediaType contentType = body.contentType();
@@ -198,7 +210,7 @@ final class ArmeriaCallFactory implements Factory {
         @Override
         public void enqueue(Callback callback) {
             createRequest();
-            httpResponse.subscribe(new ArmeriaCallSubscriber(this, callback, request));
+            httpResponse.subscribe(callFactory.subscriberFactory.create(this, callback, request));
         }
 
         @Override

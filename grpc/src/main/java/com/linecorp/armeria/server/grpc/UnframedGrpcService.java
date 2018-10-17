@@ -38,6 +38,7 @@ import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer.ByteBufOrStream
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer.Listener;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageFramer;
 import com.linecorp.armeria.internal.grpc.GrpcHeaderNames;
+import com.linecorp.armeria.internal.grpc.GrpcStatus;
 import com.linecorp.armeria.server.PathMapping;
 import com.linecorp.armeria.server.Service;
 import com.linecorp.armeria.server.ServiceRequestContext;
@@ -51,6 +52,7 @@ import io.grpc.MethodDescriptor.MethodType;
 import io.grpc.ServerMethodDefinition;
 import io.grpc.Status;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufHolder;
 
 /**
  * A {@link SimpleDecoratingService} which allows {@link GrpcService} to serve requests without the framing
@@ -69,6 +71,8 @@ import io.netty.buffer.ByteBuf;
  */
 class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpResponse>
         implements ServiceWithPathMappings<HttpRequest, HttpResponse> {
+
+    private static final char LINE_SEPARATOR = '\n';
 
     private final Map<String, MethodDescriptor<?, ?>> methodsByName;
     private final GrpcService delegateGrpcService;
@@ -107,8 +111,8 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
             }
         }
 
-        String methodName = GrpcRequestUtil.determineMethod(ctx);
-        MethodDescriptor<?, ?> method = methodName != null ? methodsByName.get(methodName) : null;
+        final String methodName = GrpcRequestUtil.determineMethod(ctx);
+        final MethodDescriptor<?, ?> method = methodName != null ? methodsByName.get(methodName) : null;
         if (method == null) {
             // Unknown method, let the delegate return a usual error.
             return delegate().serve(ctx, req);
@@ -120,7 +124,7 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
                                    "Only unary methods can be used with non-framed requests.");
         }
 
-        HttpHeaders grpcHeaders = HttpHeaders.copyOf(clientHeaders);
+        final HttpHeaders grpcHeaders = HttpHeaders.copyOf(clientHeaders);
 
         final MediaType framedContentType;
         if (contentType.is(MediaType.PROTOBUF)) {
@@ -144,18 +148,19 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
         // clear the header if it's present.
         grpcHeaders.remove(GrpcHeaderNames.GRPC_ACCEPT_ENCODING);
 
+        ctx.logBuilder().deferRequestContent();
+        ctx.logBuilder().deferResponseContent();
+
         final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
-        final HttpResponse res = HttpResponse.from(responseFuture);
-        req.aggregate().whenCompleteAsync(
+        req.aggregateWithPooledObjects(ctx.eventLoop(), ctx.alloc()).whenComplete(
                 (clientRequest, t) -> {
                     if (t != null) {
                         responseFuture.completeExceptionally(t);
                     } else {
                         frameAndServe(ctx, grpcHeaders, clientRequest, responseFuture);
                     }
-                },
-                ctx.eventLoop());
-        return res;
+                });
+        return HttpResponse.from(responseFuture);
     }
 
     private void frameAndServe(
@@ -166,12 +171,17 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
         final HttpRequest grpcRequest;
         try (ArmeriaMessageFramer framer = new ArmeriaMessageFramer(
                 ctx.alloc(), ArmeriaMessageFramer.NO_MAX_OUTBOUND_MESSAGE_SIZE)) {
-            HttpData content = clientRequest.content();
-            ByteBuf message = ctx.alloc().buffer(content.length());
+            final HttpData content = clientRequest.content();
+            final ByteBuf message;
+            if (content instanceof ByteBufHolder) {
+                message = ((ByteBufHolder) content).content();
+            } else {
+                message = ctx.alloc().buffer(content.length());
+                message.writeBytes(content.array(), content.offset(), content.length());
+            }
             final HttpData frame;
             boolean success = false;
             try {
-                message.writeBytes(content.array(), content.offset(), content.length());
                 frame = framer.writePayload(message);
                 success = true;
             } finally {
@@ -201,34 +211,44 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
                 ctx.eventLoop());
     }
 
-    private void deframeAndRespond(
+    private static void deframeAndRespond(
             ServiceRequestContext ctx,
             AggregatedHttpMessage grpcResponse,
             CompletableFuture<HttpResponse> res) {
-        HttpHeaders trailers = !grpcResponse.trailingHeaders().isEmpty() ?
-                               grpcResponse.trailingHeaders() : grpcResponse.headers();
-        String grpcStatusCode = trailers.get(GrpcHeaderNames.GRPC_STATUS);
-        Status grpcStatus = Status.fromCodeValue(Integer.parseInt(grpcStatusCode));
+        final HttpHeaders trailers = !grpcResponse.trailingHeaders().isEmpty() ?
+                                     grpcResponse.trailingHeaders() : grpcResponse.headers();
+        final String grpcStatusCode = trailers.get(GrpcHeaderNames.GRPC_STATUS);
+        final Status grpcStatus = Status.fromCodeValue(Integer.parseInt(grpcStatusCode));
 
         if (grpcStatus.getCode() != Status.OK.getCode()) {
-            StringBuilder message = new StringBuilder("grpc-status: " + grpcStatusCode);
-            String grpcMessage = trailers.get(GrpcHeaderNames.GRPC_MESSAGE);
+            final HttpStatus httpStatus = GrpcStatus.grpcCodeToHttpStatus(grpcStatus.getCode());
+            final StringBuilder message = new StringBuilder("http-status: " + httpStatus.code());
+            message.append(", ").append(httpStatus.reasonPhrase()).append(LINE_SEPARATOR);
+            message.append("Caused by: ").append(LINE_SEPARATOR);
+            message.append("grpc-status: ")
+                   .append(grpcStatusCode)
+                   .append(", ")
+                   .append(grpcStatus.getCode().name());
+            final String grpcMessage = trailers.get(GrpcHeaderNames.GRPC_MESSAGE);
             if (grpcMessage != null) {
                 message.append(", ").append(grpcMessage);
             }
+
             res.complete(HttpResponse.of(
-                    HttpStatus.INTERNAL_SERVER_ERROR,
+                    httpStatus,
                     MediaType.PLAIN_TEXT_UTF_8,
                     message.toString()));
             return;
         }
 
-        MediaType grpcMediaType = grpcResponse.headers().contentType();
-        HttpHeaders unframedHeaders = HttpHeaders.copyOf(grpcResponse.headers());
-        if (grpcMediaType.is(GrpcSerializationFormats.PROTO.mediaType())) {
-            unframedHeaders.contentType(MediaType.PROTOBUF);
-        } else if (grpcMediaType.is(GrpcSerializationFormats.JSON.mediaType())) {
-            unframedHeaders.contentType(MediaType.JSON_UTF_8);
+        final MediaType grpcMediaType = grpcResponse.headers().contentType();
+        final HttpHeaders unframedHeaders = HttpHeaders.copyOf(grpcResponse.headers());
+        if (grpcMediaType != null) {
+            if (grpcMediaType.is(GrpcSerializationFormats.PROTO.mediaType())) {
+                unframedHeaders.contentType(MediaType.PROTOBUF);
+            } else if (grpcMediaType.is(GrpcSerializationFormats.JSON.mediaType())) {
+                unframedHeaders.contentType(MediaType.JSON_UTF_8);
+            }
         }
 
         try (ArmeriaMessageDeframer deframer = new ArmeriaMessageDeframer(
@@ -237,7 +257,7 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
                     public void messageRead(ByteBufOrStream message) {
                         // We know there is only one message in total, so don't bother with checking endOfStream
                         // We also know that we don't support compression, so this is always a ByteBuffer.
-                        HttpData unframedContent = new ByteBufHttpData(message.buf(), true);
+                        final HttpData unframedContent = new ByteBufHttpData(message.buf(), true);
                         unframedHeaders.setInt(HttpHeaderNames.CONTENT_LENGTH, unframedContent.length());
                         res.complete(HttpResponse.of(unframedHeaders, unframedContent));
                     }

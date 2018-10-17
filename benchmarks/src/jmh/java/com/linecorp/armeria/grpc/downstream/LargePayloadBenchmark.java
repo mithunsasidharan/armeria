@@ -16,8 +16,6 @@
 
 package com.linecorp.armeria.grpc.downstream;
 
-import static com.linecorp.armeria.common.SessionProtocol.HTTP;
-
 import java.util.concurrent.CountDownLatch;
 
 import org.openjdk.jmh.annotations.Benchmark;
@@ -67,7 +65,6 @@ public class LargePayloadBenchmark {
     @Setup
     public void setUp() {
         server = new ServerBuilder()
-                .port(0, HTTP)
                 .serviceUnder("/", new GrpcServiceBuilder().addService(
                         new BinaryProxyImplBase() {
                             @Override
@@ -100,10 +97,10 @@ public class LargePayloadBenchmark {
                         }).unsafeWrapRequestBuffers(wrapBuffer).build())
                 .build();
         server.start().join();
-        ServerPort httpPort = server.activePorts().values().stream()
-                                    .filter(p1 -> p1.protocol() == HTTP).findAny()
-                                    .get();
-        final String url = "gproto+http://127.0.0.1:" + httpPort.localAddress().getPort() + "/";
+        final ServerPort httpPort = server.activePorts().values().stream()
+                                          .filter(ServerPort::hasHttp).findAny()
+                                          .get();
+        final String url = "gproto+http://127.0.0.1:" + httpPort.localAddress().getPort() + '/';
         binaryProxyClient = Clients.newClient(url, BinaryProxyStub.class);
     }
 
@@ -114,8 +111,8 @@ public class LargePayloadBenchmark {
 
     @Benchmark
     public boolean normal() throws Exception {
-        EchoObserver responseObserver = new EchoObserver();
-        StreamObserver<BinaryPayload> requestObserver = binaryProxyClient.echo(responseObserver);
+        final EchoObserver responseObserver = new EchoObserver();
+        final StreamObserver<BinaryPayload> requestObserver = binaryProxyClient.echo(responseObserver);
         requestObserver.onNext(PAYLOAD);
         requestObserver.onNext(PAYLOAD);
         // TODO(anuraag): Figure out why 3 requests doesn't work.
@@ -159,7 +156,7 @@ public class LargePayloadBenchmark {
     }
 
     public static void main(String[] args) throws Exception {
-        LargePayloadBenchmark benchmark = new LargePayloadBenchmark();
+        final LargePayloadBenchmark benchmark = new LargePayloadBenchmark();
         benchmark.setUp();
         try {
             benchmark.normal();

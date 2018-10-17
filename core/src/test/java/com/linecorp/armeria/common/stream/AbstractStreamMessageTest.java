@@ -25,9 +25,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.IntStream;
 
-import org.junit.AfterClass;
 import org.junit.Before;
-import org.junit.BeforeClass;
+import org.junit.ClassRule;
 import org.junit.Test;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
@@ -35,35 +34,21 @@ import org.reactivestreams.Subscription;
 import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.common.util.Exceptions;
+import com.linecorp.armeria.testing.common.EventLoopRule;
 import com.linecorp.armeria.unsafe.ByteBufHttpData;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufHolder;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.UnpooledHeapByteBuf;
-import io.netty.channel.DefaultEventLoop;
-import io.netty.channel.EventLoop;
 
 @SuppressWarnings("unchecked")  // Allow using the same tests for writers and non-writers
 public abstract class AbstractStreamMessageTest {
 
     static final List<Integer> TEN_INTEGERS = IntStream.range(0, 10).boxed().collect(toImmutableList());
 
-    private static EventLoop eventLoop;
-
-    @BeforeClass
-    public static void startEventLoop() {
-        eventLoop = new DefaultEventLoop();
-    }
-
-    @AfterClass
-    public static void stopEventLoop() {
-        eventLoop.shutdownGracefully().syncUninterruptibly();
-    }
-
-    EventLoop eventLoop() {
-        return eventLoop;
-    }
+    @ClassRule
+    public static final EventLoopRule eventLoop = new EventLoopRule();
 
     abstract <T> StreamMessage<T> newStream(List<T> inputs);
 
@@ -83,7 +68,7 @@ public abstract class AbstractStreamMessageTest {
 
     @Test
     public void full_writeFirst() throws Exception {
-        StreamMessage<Integer> stream = newStream(streamValues());
+        final StreamMessage<Integer> stream = newStream(streamValues());
         writeTenIntegers(stream);
         stream.subscribe(new ResultCollectingSubscriber() {
             @Override
@@ -96,7 +81,7 @@ public abstract class AbstractStreamMessageTest {
 
     @Test
     public void full_writeAfter() throws Exception {
-        StreamMessage<Integer> stream = newStream(streamValues());
+        final StreamMessage<Integer> stream = newStream(streamValues());
         stream.subscribe(new ResultCollectingSubscriber() {
             @Override
             public void onSubscribe(Subscription s) {
@@ -112,7 +97,7 @@ public abstract class AbstractStreamMessageTest {
     // would fail.
     @Test
     public void flowControlled_writeThenDemandThenProcess() throws Exception {
-        StreamMessage<Integer> stream = newStream(streamValues());
+        final StreamMessage<Integer> stream = newStream(streamValues());
         writeTenIntegers(stream);
         stream.subscribe(new ResultCollectingSubscriber() {
             private Subscription subscription;
@@ -134,9 +119,9 @@ public abstract class AbstractStreamMessageTest {
 
     @Test
     public void flowControlled_writeThenDemandThenProcess_eventLoop() throws Exception {
-        StreamMessage<Integer> stream = newStream(streamValues());
+        final StreamMessage<Integer> stream = newStream(streamValues());
         writeTenIntegers(stream);
-        eventLoop().submit(
+        eventLoop.get().submit(
                 () ->
                         stream.subscribe(new ResultCollectingSubscriber() {
                             private Subscription subscription;
@@ -152,13 +137,13 @@ public abstract class AbstractStreamMessageTest {
                                 subscription.request(1);
                                 super.onNext(value);
                             }
-                        }, eventLoop())).syncUninterruptibly();
+                        }, eventLoop.get())).syncUninterruptibly();
         assertSuccess();
     }
 
     @Test
     public void flowControlled_writeThenProcessThenDemand() throws Exception {
-        StreamMessage<Integer> stream = newStream(streamValues());
+        final StreamMessage<Integer> stream = newStream(streamValues());
         writeTenIntegers(stream);
         stream.subscribe(new ResultCollectingSubscriber() {
             private Subscription subscription;
@@ -181,10 +166,10 @@ public abstract class AbstractStreamMessageTest {
     @Test
     public void releaseOnConsumption_ByteBuf() throws Exception {
         final ByteBuf buf = newPooledBuffer();
-        StreamMessage<ByteBuf> stream = newStream(ImmutableList.of(buf));
+        final StreamMessage<ByteBuf> stream = newStream(ImmutableList.of(buf));
 
         if (stream instanceof StreamWriter) {
-            assertThat(((StreamWriter<ByteBuf>) stream).write(buf)).isTrue();
+            ((StreamWriter<ByteBuf>) stream).write(buf);
             ((StreamWriter<?>) stream).close();
         }
         assertThat(buf.refCnt()).isEqualTo(1);
@@ -219,10 +204,10 @@ public abstract class AbstractStreamMessageTest {
     @Test
     public void releaseOnConsumption_HttpData() throws Exception {
         final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), false);
-        StreamMessage<ByteBufHolder> stream = newStream(ImmutableList.of(data));
+        final StreamMessage<ByteBufHolder> stream = newStream(ImmutableList.of(data));
 
         if (stream instanceof StreamWriter) {
-            assertThat(((StreamWriter<ByteBufHolder>) stream).write(data)).isTrue();
+            ((StreamWriter<ByteBufHolder>) stream).write(data);
             ((StreamWriter<?>) stream).close();
         }
         assertThat(data.refCnt()).isEqualTo(1);
@@ -258,9 +243,9 @@ public abstract class AbstractStreamMessageTest {
     @Test
     public void releaseWithZeroDemand() {
         final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), true);
-        StreamMessage<Object> stream = newStream(ImmutableList.of(data));
+        final StreamMessage<Object> stream = newStream(ImmutableList.of(data));
         if (stream instanceof StreamWriter) {
-            ((StreamWriter) stream).write(data);
+            ((StreamWriter<Object>) stream).write(data);
         }
         stream.subscribe(new Subscriber<Object>() {
             @Override
@@ -292,10 +277,10 @@ public abstract class AbstractStreamMessageTest {
     @Test
     public void releaseWithZeroDemandAndClosedStream() {
         final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), true);
-        StreamMessage<Object> stream = newStream(ImmutableList.of(data));
+        final StreamMessage<Object> stream = newStream(ImmutableList.of(data));
         if (stream instanceof StreamWriter) {
-            ((StreamWriter) stream).write(data);
-            ((StreamWriter) stream).close();
+            ((StreamWriter<Object>) stream).write(data);
+            ((StreamWriter<Object>) stream).close();
         }
 
         stream.subscribe(new Subscriber<Object>() {
@@ -355,7 +340,7 @@ public abstract class AbstractStreamMessageTest {
 
     private void writeTenIntegers(StreamMessage<Integer> stream) {
         if (stream instanceof StreamWriter) {
-            StreamWriter<Integer> writer = (StreamWriter<Integer>) stream;
+            final StreamWriter<Integer> writer = (StreamWriter<Integer>) stream;
             streamValues().forEach(writer::write);
             writer.close();
         }

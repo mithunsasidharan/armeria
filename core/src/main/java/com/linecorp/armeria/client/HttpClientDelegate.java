@@ -15,19 +15,22 @@
  */
 package com.linecorp.armeria.client;
 
-import static com.linecorp.armeria.client.ClientRequestContext.HTTP_HEADERS;
 import static java.util.Objects.requireNonNull;
 
+import java.net.InetSocketAddress;
 import java.util.concurrent.CompletableFuture;
+
+import javax.annotation.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Strings;
+
 import com.linecorp.armeria.client.pool.KeyedChannelPool;
 import com.linecorp.armeria.client.pool.PoolKey;
 import com.linecorp.armeria.common.ClosedSessionException;
-import com.linecorp.armeria.common.HttpHeaderNames;
-import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.SessionProtocol;
@@ -35,96 +38,135 @@ import com.linecorp.armeria.internal.PathAndQuery;
 
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoop;
-import io.netty.util.AsciiString;
+import io.netty.resolver.AddressResolverGroup;
 import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.FutureListener;
 
 final class HttpClientDelegate implements Client<HttpRequest, HttpResponse> {
 
     private static final Logger logger = LoggerFactory.getLogger(HttpClientDelegate.class);
 
     private final HttpClientFactory factory;
+    private final AddressResolverGroup<InetSocketAddress> addressResolverGroup;
 
-    HttpClientDelegate(HttpClientFactory factory) {
+    HttpClientDelegate(HttpClientFactory factory,
+                       AddressResolverGroup<InetSocketAddress> addressResolverGroup) {
         this.factory = requireNonNull(factory, "factory");
+        this.addressResolverGroup = requireNonNull(addressResolverGroup, "addressResolverGroup");
     }
 
     @Override
     public HttpResponse execute(ClientRequestContext ctx, HttpRequest req) throws Exception {
-        final Endpoint endpoint = ctx.endpoint().resolve(ctx)
-                                     .withDefaultPort(ctx.sessionProtocol().defaultPort());
-        autoFillHeaders(ctx, endpoint, req);
         if (!sanitizePath(req)) {
             req.abort();
             return HttpResponse.ofFailure(new IllegalArgumentException("invalid path: " + req.path()));
         }
 
+        final Endpoint endpoint = ctx.endpoint().resolve(ctx)
+                                     .withDefaultPort(ctx.sessionProtocol().defaultPort());
         final EventLoop eventLoop = ctx.eventLoop();
-        final PoolKey poolKey = new PoolKey(endpoint.host(), endpoint.port(), ctx.sessionProtocol());
-        final Future<Channel> channelFuture = factory.pool(eventLoop).acquire(poolKey);
         final DecodedHttpResponse res = new DecodedHttpResponse(eventLoop);
 
-        if (channelFuture.isDone()) {
-            if (channelFuture.isSuccess()) {
-                Channel ch = channelFuture.getNow();
-                invoke0(ch, ctx, req, res, poolKey);
-            } else {
-                res.close(channelFuture.cause());
-            }
+        if (endpoint.hasIpAddr()) {
+            // IP address has been resolved already.
+            executeWithIpAddr(ctx, endpoint, endpoint.ipAddr(), req, res);
         } else {
-            channelFuture.addListener((Future<Channel> future) -> {
-                if (future.isSuccess()) {
-                    Channel ch = future.getNow();
-                    invoke0(ch, ctx, req, res, poolKey);
-                } else {
-                    res.close(channelFuture.cause());
-                }
-            });
+            // IP address has not been resolved yet.
+            final Future<InetSocketAddress> resolveFuture =
+                    addressResolverGroup.getResolver(eventLoop)
+                                        .resolve(InetSocketAddress.createUnresolved(endpoint.host(),
+                                                                                    endpoint.port()));
+            if (resolveFuture.isDone()) {
+                finishResolve(ctx, endpoint, resolveFuture, req, res);
+            } else {
+                resolveFuture.addListener(
+                        (FutureListener<InetSocketAddress>) future ->
+                                finishResolve(ctx, endpoint, future, req, res));
+            }
         }
 
         return res;
     }
 
-    private static void autoFillHeaders(ClientRequestContext ctx, Endpoint endpoint, HttpRequest req) {
-        requireNonNull(req, "req");
-        final HttpHeaders headers = req.headers();
-        final HttpHeaders clientOptionHeaders = ctx.hasAttr(HTTP_HEADERS) ? ctx.attr(HTTP_HEADERS).get()
-                                                                          : HttpHeaders.EMPTY_HEADERS;
+    private void finishResolve(ClientRequestContext ctx, Endpoint endpoint,
+                               Future<InetSocketAddress> resolveFuture, HttpRequest req,
+                               DecodedHttpResponse res) {
+        if (resolveFuture.isSuccess()) {
+            executeWithIpAddr(ctx, endpoint, resolveFuture.getNow().getAddress().getHostAddress(), req, res);
+        } else {
+            res.close(resolveFuture.cause());
+        }
+    }
 
-        if (headers.authority() == null && clientOptionHeaders.authority() == null) {
-            final String hostname = endpoint.host();
-            final int port = endpoint.port();
+    private void executeWithIpAddr(ClientRequestContext ctx, Endpoint endpoint, String ipAddr,
+                                   HttpRequest req, DecodedHttpResponse res) {
+        final String host = extractHost(ctx, req, endpoint);
+        final PoolKey poolKey = new PoolKey(host, ipAddr, endpoint.port(), ctx.sessionProtocol());
+        final Future<Channel> channelFuture = factory.pool(ctx.eventLoop()).acquire(poolKey);
 
-            final String authority;
-            if (port == ctx.sessionProtocol().defaultPort()) {
-                authority = hostname;
+        if (channelFuture.isDone()) {
+            finishExecute(ctx, poolKey, channelFuture, req, res);
+        } else {
+            channelFuture.addListener(
+                    (Future<Channel> future) -> finishExecute(ctx, poolKey, future, req, res));
+        }
+    }
+
+    private void finishExecute(ClientRequestContext ctx, PoolKey poolKey, Future<Channel> channelFuture,
+                               HttpRequest req, DecodedHttpResponse res) {
+        if (channelFuture.isSuccess()) {
+            final Channel ch = channelFuture.getNow();
+            invoke0(ch, ctx, req, res, poolKey);
+        } else {
+            res.close(channelFuture.cause());
+        }
+    }
+
+    @VisibleForTesting
+    static String extractHost(ClientRequestContext ctx, HttpRequest req, Endpoint endpoint) {
+        String host = extractHost(ctx.additionalRequestHeaders().authority());
+        if (host != null) {
+            return host;
+        }
+
+        host = extractHost(req.authority());
+        if (host != null) {
+            return host;
+        }
+
+        return endpoint.host();
+    }
+
+    @Nullable
+    private static String extractHost(@Nullable String authority) {
+        if (Strings.isNullOrEmpty(authority)) {
+            return null;
+        }
+
+        if (authority.charAt(0) == '[') {
+            // Surrounded by '[' and ']'
+            final int closingBracketPos = authority.lastIndexOf(']');
+            if (closingBracketPos > 0) {
+                return authority.substring(1, closingBracketPos);
             } else {
-                final StringBuilder buf = new StringBuilder(hostname.length() + 6);
-                buf.append(hostname);
-                buf.append(':');
-                buf.append(port);
-                authority = buf.toString();
+                // Invalid authority - no matching ']'
+                return null;
             }
-
-            headers.authority(authority);
         }
 
-        if (headers.scheme() == null) {
-            headers.scheme(ctx.sessionProtocol().isTls() ? "https" : "http");
+        // Not surrounded by '[' and ']'
+        final int colonPos = authority.lastIndexOf(':');
+        if (colonPos > 0) {
+            // Strip the port number.
+            return authority.substring(0, colonPos);
+        }
+        if (colonPos < 0) {
+            // authority does not have a port number.
+            return authority;
         }
 
-        // Add the headers specified in ClientOptions, if not overridden by request.
-        if (!clientOptionHeaders.isEmpty()) {
-            clientOptionHeaders.forEach(entry -> {
-                AsciiString name = entry.getKey();
-                if (!headers.contains(name)) {
-                    headers.set(name, entry.getValue());
-                }
-            });
-        }
-
-        if (!headers.contains(HttpHeaderNames.USER_AGENT)) {
-            headers.set(HttpHeaderNames.USER_AGENT, HttpHeaderUtil.USER_AGENT.toString());
-        }
+        // Invalid authority - ':' is the first character.
+        return null;
     }
 
     private static boolean sanitizePath(HttpRequest req) {

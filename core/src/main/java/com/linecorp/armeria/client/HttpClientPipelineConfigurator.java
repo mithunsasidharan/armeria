@@ -30,7 +30,10 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.List;
 
+import javax.annotation.Nullable;
+import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLParameters;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
@@ -58,6 +61,7 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.codec.DecoderException;
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpClientUpgradeHandler;
@@ -113,8 +117,10 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
     }
 
     private final HttpClientFactory clientFactory;
+    @Nullable
     private final SslContext sslCtx;
     private final HttpPreference httpPreference;
+    @Nullable
     private InetSocketAddress remoteAddress;
 
     HttpClientPipelineConfigurator(HttpClientFactory clientFactory, SessionProtocol sessionProtocol) {
@@ -199,13 +205,17 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
      * See <a href="https://http2.github.io/http2-spec/#discover-https">HTTP/2 specification</a>.
      */
     private void configureAsHttps(Channel ch, InetSocketAddress remoteAddr) {
+        assert sslCtx != null;
+
         final ChannelPipeline p = ch.pipeline();
         final SslHandler sslHandler = sslCtx.newHandler(ch.alloc(),
                                                         remoteAddr.getHostString(),
                                                         remoteAddr.getPort());
-        p.addLast(sslHandler);
+        p.addLast(configureSslHandler(sslHandler));
         p.addLast(TrafficLoggingHandler.CLIENT);
         p.addLast(new ChannelInboundHandlerAdapter() {
+            private boolean handshakeFailed;
+
             @Override
             public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
                 if (!(evt instanceof SslHandshakeCompletionEvent)) {
@@ -216,6 +226,8 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
                 final SslHandshakeCompletionEvent handshakeEvent = (SslHandshakeCompletionEvent) evt;
                 if (!handshakeEvent.isSuccess()) {
                     // The connection will be closed automatically by SslHandler.
+                    logger.warn("{} TLS handshake failed:", ctx.channel(), handshakeEvent.cause());
+                    handshakeFailed = true;
                     return;
                 }
 
@@ -250,10 +262,31 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
 
             @Override
             public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                if (handshakeFailed &&
+                    cause instanceof DecoderException &&
+                    cause.getCause() instanceof SSLException) {
+                    // Swallow an SSLException raised after handshake failure.
+                    return;
+                }
+
                 Exceptions.logIfUnexpected(logger, ctx.channel(), cause);
                 ctx.close();
             }
         });
+    }
+
+    /**
+     * Configures the specified {@link SslHandler} with common settings.
+     */
+    private static SslHandler configureSslHandler(SslHandler sslHandler) {
+        // Set endpoint identification algorithm so that JDK's default X509TrustManager implementation
+        // performs host name checks. Without this, the X509TrustManager implementation will never raise
+        // a CertificateException even if the domain name or IP address mismatches.
+        final SSLEngine engine = sslHandler.engine();
+        final SSLParameters params = engine.getSSLParameters();
+        params.setEndpointIdentificationAlgorithm("HTTPS");
+        engine.setSSLParameters(params);
+        return sslHandler;
     }
 
     // refer https://http2.github.io/http2-spec/#discover-http
@@ -267,6 +300,7 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
             attemptUpgrade = false;
             break;
         case HTTP2_PREFERRED:
+            assert remoteAddress != null;
             attemptUpgrade = !SessionProtocolNegotiationCache.isUnsupported(remoteAddress, H2C);
             break;
         case HTTP2_REQUIRED:
@@ -283,13 +317,13 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
                 pipeline.addLast(new DowngradeHandler());
                 pipeline.addLast(http2Handler);
             } else {
-                Http1ClientCodec http1Codec = newHttp1Codec(
+                final Http1ClientCodec http1Codec = newHttp1Codec(
                         clientFactory.maxHttp1InitialLineLength(),
                         clientFactory.maxHttp1HeaderSize(),
                         clientFactory.maxHttp1ChunkSize());
-                Http2ClientUpgradeCodec http2ClientUpgradeCodec =
+                final Http2ClientUpgradeCodec http2ClientUpgradeCodec =
                         new Http2ClientUpgradeCodec(http2Handler);
-                HttpClientUpgradeHandler http2UpgradeHandler =
+                final HttpClientUpgradeHandler http2UpgradeHandler =
                         new HttpClientUpgradeHandler(
                                 http1Codec, http2ClientUpgradeCodec,
                                 (int) Math.min(Integer.MAX_VALUE, UPGRADE_RESPONSE_MAX_LENGTH));
@@ -376,6 +410,7 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
     private final class UpgradeRequestHandler extends ChannelInboundHandlerAdapter {
 
         private final Http2ResponseDecoder responseDecoder;
+        @Nullable
         private UpgradeEvent upgradeEvt;
         private boolean needsToClose;
 
@@ -394,6 +429,7 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
             // Note: There's no need to fill Connection, Upgrade, and HTTP2-Settings headers here
             //       because they are filled by Http2ClientUpgradeCodec.
 
+            assert remoteAddress != null;
             final String host = HttpHeaderUtil.hostHeader(
                     remoteAddress.getHostString(), remoteAddress.getPort(), H1C.defaultPort());
 
@@ -535,7 +571,7 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
 
         @Override
         protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
-            if (in.readableBytes() < 4) {
+            if (in.readableBytes() < Http2CodecUtil.FRAME_HEADER_LENGTH) {
                 return;
             }
 
@@ -543,13 +579,13 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
 
             final ChannelPipeline p = ctx.pipeline();
 
-            if (in.getInt(in.readerIndex()) == 0x48545450) { // If the response starts with 'HTTP'
-                // Http2ConnectionHandler sent the preface string, but the server responded with an HTTP/1
-                // response. i.e. The server does not support HTTP/2.
+            if (!isSettingsFrame(in)) { // The first frame must be a settings frame.
+                // Http2ConnectionHandler sent the connection preface, but the server responded with
+                // something else, which means the server does not support HTTP/2.
                 SessionProtocolNegotiationCache.setUnsupported(ctx.channel().remoteAddress(), H2C);
                 if (httpPreference == HttpPreference.HTTP2_REQUIRED) {
-                    finishWithNegotiationFailure(ctx, H2C, H1C,
-                                                 "received an HTTP/1 response for the HTTP/2 preface string");
+                    finishWithNegotiationFailure(
+                            ctx, H2C, H1C, "received a non-HTTP/2 response for the HTTP/2 connection preface");
                 } else {
                     // We can silently retry with H1C.
                     retryWithH1C(ctx);
@@ -563,6 +599,12 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
             }
 
             p.remove(this);
+        }
+
+        private boolean isSettingsFrame(ByteBuf in) {
+            final int start = in.readerIndex();
+            return in.getByte(start + 3) == 4 &&             // type == SETTINGS
+                   (in.getInt(start + 5) & 0x7FFFFFFF) == 0; // streamId == 0
         }
 
         @Override
@@ -592,11 +634,11 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
         final Http2Connection conn = new DefaultHttp2Connection(false);
         conn.addListener(new Http2GoAwayListener(ch));
 
-        Http2FrameReader reader = new DefaultHttp2FrameReader(validateHeaders);
-        Http2FrameWriter writer = new DefaultHttp2FrameWriter();
+        final Http2FrameReader reader = new DefaultHttp2FrameReader(validateHeaders);
+        final Http2FrameWriter writer = new DefaultHttp2FrameWriter();
 
-        Http2ConnectionEncoder encoder = new DefaultHttp2ConnectionEncoder(conn, writer);
-        Http2ConnectionDecoder decoder = new DefaultHttp2ConnectionDecoder(conn, encoder, reader);
+        final Http2ConnectionEncoder encoder = new DefaultHttp2ConnectionEncoder(conn, writer);
+        final Http2ConnectionDecoder decoder = new DefaultHttp2ConnectionDecoder(conn, encoder, reader);
 
         final Http2Settings http2Settings = http2Settings();
 

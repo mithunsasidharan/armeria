@@ -16,8 +16,6 @@
 
 package com.linecorp.armeria.thrift;
 
-import static com.linecorp.armeria.common.SessionProtocol.HTTP;
-
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
@@ -71,8 +69,8 @@ public class PooledResponseBufferBenchmark {
 
         @Override
         public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-            HttpResponse res = delegate().serve(ctx, req);
-            HttpResponseWriter decorated = HttpResponse.streaming();
+            final HttpResponse res = delegate().serve(ctx, req);
+            final HttpResponseWriter decorated = HttpResponse.streaming();
             res.subscribe(new Subscriber<HttpObject>() {
                 @Override
                 public void onSubscribe(Subscription s) {
@@ -107,8 +105,8 @@ public class PooledResponseBufferBenchmark {
 
         @Override
         public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-            HttpResponse res = delegate().serve(ctx, req);
-            HttpResponseWriter decorated = HttpResponse.streaming();
+            final HttpResponse res = delegate().serve(ctx, req);
+            final HttpResponseWriter decorated = HttpResponse.streaming();
             res.subscribe(new Subscriber<HttpObject>() {
                 @Override
                 public void onSubscribe(Subscription s) {
@@ -140,22 +138,17 @@ public class PooledResponseBufferBenchmark {
 
     @Setup
     public void startServer() throws Exception {
-        ServerBuilder sb = new ServerBuilder()
-                .port(0, HTTP)
-                .service("/a", THttpService.of(
-                        (AsyncIface) (name, resultHandler) ->
-                                resultHandler.onComplete(RESPONSE))
-                                                  .decorate(PooledDecoratingService::new))
-                .service("/b", THttpService.of(
-                        (AsyncIface) (name, resultHandler) ->
-                                resultHandler.onComplete(RESPONSE))
-                                             .decorate(UnpooledDecoratingService::new));
+        final ServerBuilder sb = new ServerBuilder()
+                .service("/a", THttpService.of((AsyncIface) (name, cb) -> cb.onComplete(RESPONSE))
+                                           .decorate(PooledDecoratingService::new))
+                .service("/b", THttpService.of((AsyncIface) (name, cb) -> cb.onComplete(RESPONSE))
+                                           .decorate(UnpooledDecoratingService::new));
         server = sb.build();
         server.start().join();
 
-        ServerPort httpPort = server.activePorts().values().stream()
-                                    .filter(p1 -> p1.protocol() == HTTP).findAny()
-                                    .get();
+        final ServerPort httpPort = server.activePorts().values().stream()
+                                          .filter(ServerPort::hasHttp).findAny()
+                                          .get();
         pooledClient = Clients.newClient(
                 "tbinary+http://127.0.0.1:" + httpPort.localAddress().getPort() + "/a",
                 HelloService.Iface.class);

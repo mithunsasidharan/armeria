@@ -30,26 +30,35 @@
  */
 package com.linecorp.armeria.internal;
 
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static io.netty.handler.codec.http.HttpUtil.isAsteriskForm;
 import static io.netty.handler.codec.http.HttpUtil.isOriginForm;
 import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
 import static io.netty.handler.codec.http2.Http2Exception.streamError;
 import static io.netty.util.AsciiString.EMPTY_STRING;
 import static io.netty.util.ByteProcessor.FIND_COMMA;
+import static io.netty.util.internal.StringUtil.decodeHexNibble;
 import static io.netty.util.internal.StringUtil.isNullOrEmpty;
 import static io.netty.util.internal.StringUtil.length;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.StringJoiner;
 
+import javax.annotation.Nullable;
+
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
 
 import com.linecorp.armeria.common.DefaultHttpHeaders;
+import com.linecorp.armeria.common.Flags;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
@@ -158,10 +167,20 @@ public final class ArmeriaHttpUtil {
     private static final Splitter COOKIE_SPLITTER = Splitter.on(';').trimResults().omitEmptyStrings();
     private static final String COOKIE_SEPARATOR = "; ";
 
+    @Nullable
+    private static final LoadingCache<AsciiString, String> HEADER_VALUE_CACHE =
+            Flags.headerValueCacheSpec().map(ArmeriaHttpUtil::buildCache).orElse(null);
+    private static final Set<AsciiString> CACHED_HEADERS = Flags.cachedHeaders().stream().map(AsciiString::of)
+                                                                .collect(toImmutableSet());
+
+    private static LoadingCache<AsciiString, String> buildCache(String spec) {
+        return Caffeine.from(spec).build(AsciiString::toString);
+    }
+
     /**
      * Concatenates two path strings.
      */
-    public static String concatPaths(String path1, String path2) {
+    public static String concatPaths(@Nullable String path1, @Nullable String path2) {
         path2 = path2 == null ? "" : path2;
 
         if (path1 == null || path1.isEmpty() || EMPTY_REQUEST_PATH.equals(path1)) {
@@ -210,6 +229,48 @@ public final class ArmeriaHttpUtil {
     }
 
     /**
+     * Decodes a percent-encoded path string.
+     */
+    public static String decodePath(String path) {
+        if (path.indexOf('%') < 0) {
+            // No need to decoded; not percent-encoded
+            return path;
+        }
+
+        // Decode percent-encoded characters.
+        // An invalid character is replaced with 0xFF, which will be replaced into '�' by UTF-8 decoder.
+        final int len = path.length();
+        final byte[] buf = new byte[len];
+        int dstLen = 0;
+        for (int i = 0; i < len; i++) {
+            final char ch = path.charAt(i);
+            if (ch != '%') {
+                buf[dstLen++] = (byte) ((ch & 0xFF80) == 0 ? ch : 0xFF);
+                continue;
+            }
+
+            // Decode a percent-encoded character.
+            final int hexEnd = i + 3;
+            if (hexEnd > len) {
+                // '%' or '%x' (must be followed by two hexadigits)
+                buf[dstLen++] = (byte) 0xFF;
+                break;
+            }
+
+            final int digit1 = decodeHexNibble(path.charAt(++i));
+            final int digit2 = decodeHexNibble(path.charAt(++i));
+            if (digit1 < 0 || digit2 < 0) {
+                // The first or second digit is not hexadecimal.
+                buf[dstLen++] = (byte) 0xFF;
+            } else {
+                buf[dstLen++] = (byte) ((digit1 << 4) | digit2);
+            }
+        }
+
+        return new String(buf, 0, dstLen, StandardCharsets.UTF_8);
+    }
+
+    /**
      * Returns {@code true} if the content of the response with the given {@link HttpStatus} is expected to
      * be always empty (1xx, 204, 205 and 304 responses.)
      */
@@ -254,8 +315,8 @@ public final class ArmeriaHttpUtil {
     /**
      * Converts the specified Netty HTTP/2 into Armeria HTTP/2 headers.
      */
-    public static HttpHeaders toArmeria(Http2Headers headers) {
-        final HttpHeaders converted = new DefaultHttpHeaders(false, headers.size());
+    public static HttpHeaders toArmeria(Http2Headers headers, boolean endOfStream) {
+        final HttpHeaders converted = new DefaultHttpHeaders(false, headers.size(), endOfStream);
         StringJoiner cookieJoiner = null;
         for (Entry<CharSequence, CharSequence> e : headers) {
             final AsciiString name = AsciiString.of(e.getKey());
@@ -269,7 +330,7 @@ public final class ArmeriaHttpUtil {
                 }
                 COOKIE_SPLITTER.split(value).forEach(cookieJoiner::add);
             } else {
-                converted.add(name, value.toString());
+                converted.add(name, convertHeaderValue(name, value));
             }
         }
 
@@ -301,7 +362,7 @@ public final class ArmeriaHttpUtil {
 
         if (!isOriginForm(requestTargetUri) && !isAsteriskForm(requestTargetUri)) {
             // Attempt to take from HOST header before taking from the request-line
-            String host = inHeaders.getAsString(HttpHeaderNames.HOST);
+            final String host = inHeaders.getAsString(HttpHeaderNames.HOST);
             setHttp2Authority(host == null || host.isEmpty() ? requestTargetUri.getAuthority() : host, out);
         }
 
@@ -314,7 +375,7 @@ public final class ArmeriaHttpUtil {
      * Converts the headers of the given Netty HTTP/1.x response into Armeria HTTP/2 headers.
      */
     public static HttpHeaders toArmeria(HttpResponse in) {
-        io.netty.handler.codec.http.HttpHeaders inHeaders = in.headers();
+        final io.netty.handler.codec.http.HttpHeaders inHeaders = in.headers();
         final HttpHeaders out = new DefaultHttpHeaders(true, inHeaders.size());
         out.status(in.status().code());
 
@@ -368,7 +429,7 @@ public final class ArmeriaHttpUtil {
                 }
                 COOKIE_SPLITTER.split(value).forEach(cookieJoiner::add);
             } else {
-                out.add(aName, value.toString());
+                out.add(aName, convertHeaderValue(aName, value));
             }
         }
 
@@ -379,10 +440,10 @@ public final class ArmeriaHttpUtil {
 
     private static CharSequenceMap toLowercaseMap(Iterator<? extends CharSequence> valuesIter,
                                                   int arraySizeHint) {
-        CharSequenceMap result = new CharSequenceMap(arraySizeHint);
+        final CharSequenceMap result = new CharSequenceMap(arraySizeHint);
 
         while (valuesIter.hasNext()) {
-            AsciiString lowerCased = AsciiString.of(valuesIter.next()).toLowerCase();
+            final AsciiString lowerCased = AsciiString.of(valuesIter.next()).toLowerCase();
             try {
                 int index = lowerCased.forEachByte(FIND_COMMA);
                 if (index != -1) {
@@ -420,7 +481,7 @@ public final class ArmeriaHttpUtil {
                 out.add(HttpHeaderNames.TE, HttpHeaderValues.TRAILERS.toString());
             }
         } else {
-            List<CharSequence> teValues = StringUtil.unescapeCsvFields(entry.getValue());
+            final List<CharSequence> teValues = StringUtil.unescapeCsvFields(entry.getValue());
             for (CharSequence teValue : teValues) {
                 if (AsciiString.contentEqualsIgnoreCase(AsciiString.trim(teValue),
                                                         HttpHeaderValues.TRAILERS)) {
@@ -471,7 +532,7 @@ public final class ArmeriaHttpUtil {
     }
 
     @VisibleForTesting
-    static void setHttp2Authority(String authority, HttpHeaders out) {
+    static void setHttp2Authority(@Nullable String authority, HttpHeaders out) {
         // The authority MUST NOT include the deprecated "userinfo" subcomponent
         if (authority != null) {
             final String actualAuthority;
@@ -492,14 +553,14 @@ public final class ArmeriaHttpUtil {
     }
 
     private static void setHttp2Scheme(io.netty.handler.codec.http.HttpHeaders in, URI uri, HttpHeaders out) {
-        String value = uri.getScheme();
+        final String value = uri.getScheme();
         if (value != null) {
             out.scheme(value);
             return;
         }
 
         // Consume the Scheme extension header if present
-        CharSequence cValue = in.get(ExtensionHeaderNames.SCHEME.text());
+        final CharSequence cValue = in.get(ExtensionHeaderNames.SCHEME.text());
         if (cValue != null) {
             out.scheme(cValue.toString());
         } else {
@@ -557,7 +618,7 @@ public final class ArmeriaHttpUtil {
             for (Entry<AsciiString, String> entry : inputHeaders) {
                 final AsciiString name = entry.getKey();
                 final String value = entry.getValue();
-                AsciiString translatedName = translations.get(name);
+                final AsciiString translatedName = translations.get(name);
                 if (translatedName != null) {
                     outputHeaders.add(translatedName, value);
                     continue;
@@ -590,6 +651,18 @@ public final class ArmeriaHttpUtil {
         if (!isTrailer) {
             HttpUtil.setKeepAlive(outputHeaders, httpVersion, true);
         }
+    }
+
+    private static String convertHeaderValue(AsciiString name, CharSequence value) {
+        if (!(value instanceof AsciiString)) {
+            return value.toString();
+        }
+        if (HEADER_VALUE_CACHE != null && CACHED_HEADERS.contains(name)) {
+            final String converted = HEADER_VALUE_CACHE.get((AsciiString) value);
+            assert converted != null; // loader does not return null.
+            return converted;
+        }
+        return value.toString();
     }
 
     private static final class CharSequenceMap

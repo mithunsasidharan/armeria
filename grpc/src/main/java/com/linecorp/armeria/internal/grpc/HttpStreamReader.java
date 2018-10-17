@@ -18,18 +18,20 @@ package com.linecorp.armeria.internal.grpc;
 
 import static java.util.Objects.requireNonNull;
 
+import java.util.function.BiConsumer;
+
 import javax.annotation.Nullable;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpObject;
+import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.common.HttpStatusClass;
 
 import io.grpc.Decompressor;
 import io.grpc.DecompressorRegistry;
@@ -38,9 +40,7 @@ import io.grpc.Status;
 /**
  * A {@link Subscriber} to read HTTP messages and pass to gRPC business logic.
  */
-public class HttpStreamReader implements Subscriber<HttpObject> {
-
-    private static final Logger logger = LoggerFactory.getLogger(HttpStreamReader.class);
+public class HttpStreamReader implements Subscriber<HttpObject>, BiConsumer<Void, Throwable> {
 
     private final DecompressorRegistry decompressorRegistry;
     private final TransportStatusListener transportStatusListener;
@@ -54,6 +54,8 @@ public class HttpStreamReader implements Subscriber<HttpObject> {
     private int deferredInitialMessageRequest;
 
     private volatile boolean cancelled;
+
+    private boolean sawLeadingHeaders;
 
     public HttpStreamReader(DecompressorRegistry decompressorRegistry,
                             ArmeriaMessageDeframer deframer,
@@ -94,15 +96,39 @@ public class HttpStreamReader implements Subscriber<HttpObject> {
         if (obj instanceof HttpHeaders) {
             // Only clients will see headers from a stream. It doesn't hurt to share this logic between server
             // and client though as everything else is identical.
-            HttpHeaders headers = (HttpHeaders) obj;
-            String grpcStatus = headers.get(GrpcHeaderNames.GRPC_STATUS);
+            final HttpHeaders headers = (HttpHeaders) obj;
+
+            if (!sawLeadingHeaders) {
+                final HttpStatus status = headers.status();
+                if (status == null) {
+                    // Not allowed to have empty leading headers, kill the stream hard.
+                    transportStatusListener.transportReportStatus(
+                            Status.INTERNAL.withDescription("Missing HTTP status code"));
+                    return;
+                }
+
+                if (status.codeClass() == HttpStatusClass.INFORMATIONAL) {
+                    // Skip informational headers.
+                    return;
+                }
+
+                sawLeadingHeaders = true;
+
+                if (!status.equals(HttpStatus.OK)) {
+                    transportStatusListener.transportReportStatus(
+                            GrpcStatus.httpStatusToGrpcStatus(status.code()));
+                    return;
+                }
+            }
+
+            final String grpcStatus = headers.get(GrpcHeaderNames.GRPC_STATUS);
             if (grpcStatus != null) {
                 Status status = Status.fromCodeValue(Integer.valueOf(grpcStatus));
                 if (status.getCode() == Status.OK.getCode()) {
                    // Successful response, finish delivering messages before returning the status.
                    closeDeframer();
                 }
-                String grpcMessage = headers.get(GrpcHeaderNames.GRPC_MESSAGE);
+                final String grpcMessage = headers.get(GrpcHeaderNames.GRPC_MESSAGE);
                 if (grpcMessage != null) {
                     status = status.withDescription(grpcMessage);
                 }
@@ -111,9 +137,9 @@ public class HttpStreamReader implements Subscriber<HttpObject> {
             }
             // Headers without grpc-status are the leading headers of a non-failing response, prepare to receive
             // messages.
-            String grpcEncoding = headers.get(GrpcHeaderNames.GRPC_ENCODING);
+            final String grpcEncoding = headers.get(GrpcHeaderNames.GRPC_ENCODING);
             if (grpcEncoding != null) {
-                Decompressor decompressor = decompressorRegistry.lookupDecompressor(grpcEncoding);
+                final Decompressor decompressor = decompressorRegistry.lookupDecompressor(grpcEncoding);
                 if (decompressor == null) {
                     transportStatusListener.transportReportStatus(Status.INTERNAL.withDescription(
                             "Can't find decompressor for " + grpcEncoding));
@@ -124,7 +150,7 @@ public class HttpStreamReader implements Subscriber<HttpObject> {
             requestHttpFrame();
             return;
         }
-        HttpData data = (HttpData) obj;
+        final HttpData data = (HttpData) obj;
         try {
             deframer.deframe(data, false);
         } catch (Throwable cause) {
@@ -140,18 +166,25 @@ public class HttpStreamReader implements Subscriber<HttpObject> {
 
     @Override
     public void onError(Throwable cause) {
-        if (cancelled) {
-            return;
-        }
-        transportStatusListener.transportReportStatus(GrpcStatus.fromThrowable(cause));
+        // Handled by accept() below.
     }
 
     @Override
     public void onComplete() {
+        // Handled by accept() below.
+    }
+
+    @Override
+    public void accept(Void unused, Throwable cause) {
         if (cancelled) {
             return;
         }
-        closeDeframer();
+
+        if (cause == null) {
+            closeDeframer();
+        } else {
+            transportStatusListener.transportReportStatus(GrpcStatus.fromThrowable(cause));
+        }
     }
 
     public void cancel() {

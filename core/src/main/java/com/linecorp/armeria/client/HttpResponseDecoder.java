@@ -18,6 +18,7 @@ package com.linecorp.armeria.client;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
@@ -37,7 +38,7 @@ import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.internal.InboundTrafficController;
 
 import io.netty.channel.Channel;
-import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.EventLoop;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
 import io.netty.util.concurrent.ScheduledFuture;
@@ -65,7 +66,7 @@ abstract class HttpResponseDecoder {
     }
 
     HttpResponseWrapper addResponse(
-            int id, HttpRequest req, DecodedHttpResponse res, RequestLogBuilder logBuilder,
+            int id, @Nullable HttpRequest req, DecodedHttpResponse res, RequestLogBuilder logBuilder,
             long responseTimeoutMillis, long maxContentLength) {
 
         final HttpResponseWrapper newRes =
@@ -116,15 +117,17 @@ abstract class HttpResponseDecoder {
     }
 
     static final class HttpResponseWrapper implements StreamWriter<HttpObject>, Runnable {
+        @Nullable
         private final HttpRequest request;
         private final DecodedHttpResponse delegate;
         private final RequestLogBuilder logBuilder;
         private final long responseTimeoutMillis;
         private final long maxContentLength;
+        @Nullable
         private ScheduledFuture<?> responseTimeoutFuture;
 
-        HttpResponseWrapper(HttpRequest request, DecodedHttpResponse delegate, RequestLogBuilder logBuilder,
-                            long responseTimeoutMillis, long maxContentLength) {
+        HttpResponseWrapper(@Nullable HttpRequest request, DecodedHttpResponse delegate,
+                            RequestLogBuilder logBuilder, long responseTimeoutMillis, long maxContentLength) {
             this.request = request;
             this.delegate = delegate;
             this.logBuilder = logBuilder;
@@ -136,7 +139,7 @@ abstract class HttpResponseDecoder {
             return delegate.completionFuture();
         }
 
-        void scheduleTimeout(ChannelHandlerContext ctx) {
+        void scheduleTimeout(EventLoop eventLoop) {
             if (responseTimeoutFuture != null || responseTimeoutMillis <= 0 || !isOpen()) {
                 // No need to schedule a response timeout if:
                 // - the timeout has been scheduled already,
@@ -145,7 +148,7 @@ abstract class HttpResponseDecoder {
                 return;
             }
 
-            responseTimeoutFuture = ctx.channel().eventLoop().schedule(
+            responseTimeoutFuture = eventLoop.schedule(
                     this, responseTimeoutMillis, TimeUnit.MILLISECONDS);
         }
 
@@ -184,7 +187,7 @@ abstract class HttpResponseDecoder {
         }
 
         @Override
-        public boolean write(HttpObject o) {
+        public boolean tryWrite(HttpObject o) {
             if (o instanceof HttpHeaders) {
                 // NB: It's safe to call logBuilder.start() multiple times.
                 //     See AbstractMessageLog.start() for more information.
@@ -197,12 +200,12 @@ abstract class HttpResponseDecoder {
             } else if (o instanceof HttpData) {
                 logBuilder.increaseResponseLength(((HttpData) o).length());
             }
-            return delegate.write(o);
+            return delegate.tryWrite(o);
         }
 
         @Override
-        public boolean write(Supplier<? extends HttpObject> o) {
-            return delegate.write(o);
+        public boolean tryWrite(Supplier<? extends HttpObject> o) {
+            return delegate.tryWrite(o);
         }
 
         @Override
@@ -210,25 +213,26 @@ abstract class HttpResponseDecoder {
             return delegate.onDemand(task);
         }
 
+        void onSubscriptionCancelled() {
+            close(null, this::cancelAction);
+        }
+
         @Override
         public void close() {
-            if (cancelTimeout()) {
-                delegate.close();
-                logBuilder.endResponse();
-            }
-
-            if (request != null) {
-                request.abort();
-            }
+            close(null, this::closeAction);
         }
 
         @Override
         public void close(Throwable cause) {
+            close(cause, this::closeAction);
+        }
+
+        private void close(@Nullable Throwable cause,
+                           Consumer<Throwable> actionOnTimeoutCancelled) {
             if (cancelTimeout()) {
-                delegate.close(cause);
-                logBuilder.endResponse(cause);
+                actionOnTimeoutCancelled.accept(cause);
             } else {
-                if (!Exceptions.isExpected(cause)) {
+                if (cause != null && !Exceptions.isExpected(cause)) {
                     logger.warn("Unexpected exception:", cause);
                 }
             }
@@ -236,6 +240,20 @@ abstract class HttpResponseDecoder {
             if (request != null) {
                 request.abort();
             }
+        }
+
+        private void closeAction(@Nullable Throwable cause) {
+            if (cause != null) {
+                delegate.close(cause);
+                logBuilder.endResponse(cause);
+            } else {
+                delegate.close();
+                logBuilder.endResponse();
+            }
+        }
+
+        private void cancelAction(@Nullable Throwable cause) {
+            logBuilder.endResponse();
         }
 
         @Override

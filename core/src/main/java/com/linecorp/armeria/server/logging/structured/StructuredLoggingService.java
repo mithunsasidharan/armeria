@@ -18,6 +18,8 @@ package com.linecorp.armeria.server.logging.structured;
 
 import static java.util.Objects.requireNonNull;
 
+import javax.annotation.Nullable;
+
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.logging.RequestLog;
@@ -28,6 +30,7 @@ import com.linecorp.armeria.server.Service;
 import com.linecorp.armeria.server.ServiceConfig;
 import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.SimpleDecoratingService;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 /**
  * A decorating service which provides support of structured and optionally externalized request/response
@@ -36,11 +39,15 @@ import com.linecorp.armeria.server.SimpleDecoratingService;
  * @param <I> the {@link Request} type
  * @param <O> the {@link Response} type
  * @param <L> the type of the structured log representation
+ *
+ * @deprecated Use {@link AccessLogWriter}.
  */
+@Deprecated
 public abstract class StructuredLoggingService<I extends Request, O extends Response, L>
         extends SimpleDecoratingService<I, O> {
 
     private final StructuredLogBuilder<L> logBuilder;
+    @Nullable
     private Server associatedServer;
 
     /**
@@ -70,7 +77,7 @@ public abstract class StructuredLoggingService<I extends Request, O extends Resp
         associatedServer = cfg.server();
         associatedServer.addListener(new ServerListenerAdapter() {
             @Override
-            public void serverStopped(Server server) throws Exception {
+            public void serverStopped(Server server) {
                 close();
             }
         });
@@ -79,7 +86,7 @@ public abstract class StructuredLoggingService<I extends Request, O extends Resp
     @Override
     public O serve(ServiceRequestContext ctx, I req) throws Exception {
         ctx.log().addListener(log -> {
-            L structuredLog = logBuilder.build(log);
+            final L structuredLog = logBuilder.build(log);
             if (structuredLog != null) {
                 writeLog(log, structuredLog);
             }

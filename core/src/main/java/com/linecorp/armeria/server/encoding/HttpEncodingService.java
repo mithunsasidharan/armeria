@@ -31,7 +31,7 @@ import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.SimpleDecoratingService;
 
 /**
- * A {@link DecoratingService} that applies HTTP encoding (e.g., gzip) to an {@link HttpService}.
+ * Decorates a {@link Service} to apply HTTP encoding (e.g., gzip) to an {@link HttpService}.
  * HTTP encoding will be applied if the client specifies it, the response content type is a reasonable
  * type to encode, and the response either has no fixed content length or the length is larger than 1KB.
  */
@@ -78,8 +78,8 @@ public class HttpEncodingService
 
     @Override
     public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-        HttpEncodingType encodingType = HttpEncoders.getWrapperForRequest(req);
-        HttpResponse delegateResponse = delegate().serve(ctx, req);
+        final HttpEncodingType encodingType = HttpEncoders.getWrapperForRequest(req);
+        final HttpResponse delegateResponse = delegate().serve(ctx, req);
         if (encodingType == null) {
             return delegateResponse;
         }

@@ -23,6 +23,8 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.concurrent.ScheduledFuture;
 
+import javax.annotation.Nullable;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,9 +73,12 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
     /**
      * The current negotiated {@link SessionProtocol}.
      */
+    @Nullable
     private SessionProtocol protocol;
 
+    @Nullable
     private HttpResponseDecoder responseDecoder;
+    @Nullable
     private HttpObjectEncoder requestEncoder;
 
     /**
@@ -103,11 +108,13 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
 
     @Override
     public InboundTrafficController inboundTrafficController() {
+        assert responseDecoder != null;
         return responseDecoder.inboundTrafficController();
     }
 
     @Override
     public boolean hasUnfinishedResponses() {
+        assert responseDecoder != null;
         return responseDecoder.hasUnfinishedResponses();
     }
 
@@ -118,15 +125,16 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
 
     @Override
     public boolean invoke(ClientRequestContext ctx, HttpRequest req, DecodedHttpResponse res) {
-        if (!res.isOpen()) {
-            // The response has been closed even before its request is sent.
-            req.abort();
+        if (handleEarlyCancellation(ctx, req, res)) {
             return true;
         }
 
         final long writeTimeoutMillis = ctx.writeTimeoutMillis();
         final long responseTimeoutMillis = ctx.responseTimeoutMillis();
         final long maxContentLength = ctx.maxResponseLength();
+
+        assert responseDecoder != null;
+        assert requestEncoder != null;
 
         final int numRequestsSent = ++this.numRequestsSent;
         final HttpResponseWrapper wrappedRes =
@@ -147,6 +155,36 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
         }
     }
 
+    private boolean handleEarlyCancellation(ClientRequestContext ctx, HttpRequest req,
+                                            DecodedHttpResponse res) {
+        if (res.isOpen()) {
+            return false;
+        }
+
+        // The response has been closed even before its request is sent.
+        assert protocol != null;
+
+        req.abort();
+        ctx.logBuilder().startRequest(channel, protocol);
+        ctx.logBuilder().requestHeaders(req.headers());
+        req.completionFuture().whenComplete((unused, cause) -> {
+            if (cause == null) {
+                ctx.logBuilder().endRequest();
+            } else {
+                ctx.logBuilder().endRequest(cause);
+            }
+        });
+        res.completionFuture().whenComplete((unused, cause) -> {
+            if (cause == null) {
+                ctx.logBuilder().endResponse();
+            } else {
+                ctx.logBuilder().endResponse(cause);
+            }
+        });
+
+        return true;
+    }
+
     @Override
     public void retryWithH1C() {
         needsRetryWithH1C = true;
@@ -159,7 +197,7 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
-        active = ctx.channel().isActive();
+        active = channel.isActive();
     }
 
     @Override
@@ -198,17 +236,17 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
             final SessionProtocol protocol = (SessionProtocol) evt;
             this.protocol = protocol;
             if (protocol == H1 || protocol == H1C) {
-                requestEncoder = new Http1ObjectEncoder(false, protocol.isTls());
+                requestEncoder = new Http1ObjectEncoder(channel, false, protocol.isTls());
                 responseDecoder = ctx.pipeline().get(Http1ResponseDecoder.class);
             } else if (protocol == H2 || protocol == H2C) {
                 final Http2ConnectionHandler handler = ctx.pipeline().get(Http2ConnectionHandler.class);
-                requestEncoder = new Http2ObjectEncoder(handler.encoder());
+                requestEncoder = new Http2ObjectEncoder(ctx, handler.encoder());
                 responseDecoder = ctx.pipeline().get(Http2ClientConnectionHandler.class).responseDecoder();
             } else {
                 throw new Error(); // Should never reach here.
             }
 
-            if (!sessionPromise.trySuccess(ctx.channel())) {
+            if (!sessionPromise.trySuccess(channel)) {
                 // Session creation has been failed already; close the connection.
                 ctx.close();
             }
@@ -229,7 +267,7 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
             return;
         }
 
-        logger.warn("{} Unexpected user event: {}", ctx.channel(), evt);
+        logger.warn("{} Unexpected user event: {}", channel, evt);
     }
 
     @Override
@@ -240,7 +278,7 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
         if (needsRetryWithH1C) {
             assert responseDecoder == null || !responseDecoder.hasUnfinishedResponses();
             sessionTimeoutFuture.cancel(false);
-            channelFactory.connect(ctx.channel().remoteAddress(), H1C, sessionPromise);
+            channelFactory.connect(channel.remoteAddress(), H1C, sessionPromise);
         } else {
             // Fail all pending responses.
             failUnfinishedResponses(ClosedSessionException.get());
@@ -254,8 +292,8 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        Exceptions.logIfUnexpected(logger, ctx.channel(), protocol(), cause);
-        if (ctx.channel().isActive()) {
+        Exceptions.logIfUnexpected(logger, channel, protocol(), cause);
+        if (channel.isActive()) {
             ctx.close();
         }
     }

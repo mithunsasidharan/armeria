@@ -20,6 +20,8 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.concurrent.CompletableFuture;
 
+import javax.annotation.Nullable;
+
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
@@ -91,6 +93,7 @@ public abstract class FilteredStreamMessage<T, U> implements StreamMessage<U> {
      * subscription. This method may rewrite the {@code cause} and then return a new one so that the new
      * {@link Throwable} would be passed to {@link Subscriber#onError(Throwable)}.
      */
+    @Nullable
     protected Throwable beforeError(Subscriber<? super U> subscriber, Throwable cause) {
         return cause;
     }
@@ -172,8 +175,10 @@ public abstract class FilteredStreamMessage<T, U> implements StreamMessage<U> {
             if (filteredCause != null) {
                 delegate.onError(filteredCause);
             } else {
-                logger.warn("{}#beforeError() returned null. Using the original exception:",
-                            FilteredStreamMessage.this.getClass().getName(), t.toString());
+                if (logger.isWarnEnabled()) {
+                    logger.warn("{}#beforeError() returned null. Using the original exception: {}",
+                                FilteredStreamMessage.this.getClass().getName(), t.toString());
+                }
                 delegate.onError(t);
             }
         }

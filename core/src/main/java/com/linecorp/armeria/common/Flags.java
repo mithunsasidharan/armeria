@@ -16,11 +16,14 @@
 
 package com.linecorp.armeria.common;
 
+import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.function.IntPredicate;
 import java.util.function.LongPredicate;
 import java.util.function.Predicate;
 
+import javax.annotation.Nullable;
 import javax.net.ssl.SSLEngine;
 
 import org.slf4j.Logger;
@@ -30,6 +33,8 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.CaffeineSpec;
 import com.google.common.base.Ascii;
+import com.google.common.base.CharMatcher;
+import com.google.common.base.Splitter;
 
 import com.linecorp.armeria.client.ClientFactoryBuilder;
 import com.linecorp.armeria.client.retry.Backoff;
@@ -38,6 +43,8 @@ import com.linecorp.armeria.client.retry.RetryingRpcClient;
 import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.server.PathMappingContext;
 import com.linecorp.armeria.server.ServiceConfig;
+import com.linecorp.armeria.server.annotation.ExceptionHandler;
+import com.linecorp.armeria.server.annotation.ExceptionVerbosity;
 
 import io.netty.channel.epoll.Epoll;
 import io.netty.handler.ssl.OpenSsl;
@@ -49,16 +56,26 @@ public final class Flags {
 
     private static final Logger logger = LoggerFactory.getLogger(Flags.class);
 
+    private static final Splitter CSV_SPLITTER = Splitter.on(',').trimResults().omitEmptyStrings();
+
     private static final String PREFIX = "com.linecorp.armeria.";
 
     private static final int NUM_CPU_CORES = Runtime.getRuntime().availableProcessors();
 
-    private static final boolean VERBOSE_EXCEPTION = getBoolean("verboseExceptions", false);
+    private static final boolean VERBOSE_EXCEPTIONS = getBoolean("verboseExceptions", false);
 
-    private static final boolean USE_EPOLL = getBoolean("useEpoll", Epoll.isAvailable(),
-                                                        value -> Epoll.isAvailable() || !value);
+    private static final boolean VERBOSE_RESPONSES = getBoolean("verboseResponses", false);
+
+    private static final boolean HAS_WSLENV = System.getenv("WSLENV") != null;
+    private static final boolean USE_EPOLL = getBoolean("useEpoll", isEpollAvailable(),
+                                                        value -> isEpollAvailable() || !value);
+
     private static final boolean USE_OPENSSL = getBoolean("useOpenSsl", OpenSsl.isAvailable(),
                                                           value -> OpenSsl.isAvailable() || !value);
+
+    private static final int DEFAULT_MAX_NUM_CONNECTIONS = Integer.MAX_VALUE;
+    private static final int MAX_NUM_CONNECTIONS =
+            getInt("maxNumConnections", DEFAULT_MAX_NUM_CONNECTIONS, value -> value > 0);
 
     private static final int DEFAULT_NUM_COMMON_WORKERS = NUM_CPU_CORES * 2;
     private static final int NUM_COMMON_WORKERS =
@@ -134,7 +151,7 @@ public final class Flags {
                    DEFAULT_DEFAULT_MAX_HTTP1_CHUNK_SIZE,
                    value -> value >= 0);
 
-    private static final boolean DEFAULT_USE_HTTP2_PREFACE = getBoolean("defaultUseHttp2Preface", false);
+    private static final boolean DEFAULT_USE_HTTP2_PREFACE = getBoolean("defaultUseHttp2Preface", true);
     private static final boolean DEFAULT_USE_HTTP1_PIPELINING = getBoolean("defaultUseHttp1Pipelining", false);
 
     private static final String DEFAULT_DEFAULT_BACKOFF_SPEC =
@@ -168,10 +185,33 @@ public final class Flags {
     private static final Optional<String> PARSED_PATH_CACHE_SPEC =
             caffeineSpec("parsedPathCache", DEFAULT_PARSED_PATH_CACHE_SPEC);
 
+    private static final String DEFAULT_HEADER_VALUE_CACHE_SPEC = "maximumSize=4096";
+    private static final Optional<String> HEADER_VALUE_CACHE_SPEC =
+            caffeineSpec("headerValueCache", DEFAULT_HEADER_VALUE_CACHE_SPEC);
+
+    private static final String DEFAULT_CACHED_HEADERS =
+            ":authority,:scheme,:method,accept-encoding,content-type";
+    private static final List<String> CACHED_HEADERS =
+            CSV_SPLITTER.splitToList(getNormalized(
+                    "cachedHeaders", DEFAULT_CACHED_HEADERS, CharMatcher.ascii()::matchesAllOf));
+
+    private static final String DEFAULT_ANNOTATED_SERVICE_EXCEPTION_VERBOSITY = "unhandled";
+    private static final ExceptionVerbosity ANNOTATED_SERVICE_EXCEPTION_VERBOSITY =
+            exceptionLoggingMode("annotatedServiceExceptionVerbosity",
+                                 DEFAULT_ANNOTATED_SERVICE_EXCEPTION_VERBOSITY);
+
     static {
-        if (!Epoll.isAvailable()) {
-            final Throwable cause = Exceptions.peel(Epoll.unavailabilityCause());
-            logger.info("/dev/epoll not available: {}", cause.toString());
+        if (!isEpollAvailable()) {
+            final Throwable cause = Epoll.unavailabilityCause();
+            if (cause != null) {
+                logger.info("/dev/epoll not available: {}", Exceptions.peel(cause).toString());
+            } else {
+                if (HAS_WSLENV) {
+                    logger.info("/dev/epoll not available: WSL not supported");
+                } else {
+                    logger.info("/dev/epoll not available: ?");
+                }
+            }
         } else if (USE_EPOLL) {
             logger.info("Using /dev/epoll");
         }
@@ -186,6 +226,12 @@ public final class Flags {
         }
     }
 
+    private static boolean isEpollAvailable() {
+        // Netty epoll transport does not work with WSL (Windows Sybsystem for Linux) yet.
+        // TODO(trustin): Re-enable on WSL if https://github.com/Microsoft/WSL/issues/1982 is resolved.
+        return Epoll.isAvailable() && !HAS_WSLENV;
+    }
+
     /**
      * Returns whether the verbose exception mode is enabled. When enabled, the exceptions frequently thrown by
      * Armeria will have full stack trace. When disabled, such exceptions will have empty stack trace to
@@ -195,7 +241,19 @@ public final class Flags {
      * JVM option to enable it.
      */
     public static boolean verboseExceptions() {
-        return VERBOSE_EXCEPTION;
+        return VERBOSE_EXCEPTIONS;
+    }
+
+    /**
+     * Returns whether the verbose response mode is enabled. When enabled, the server responses will contain
+     * the exception type and its full stack trace, which may be useful for debugging while potentially
+     * insecure. When disabled, the server responses will not expose such server-side details to the client.
+     *
+     * <p>This flag is disabled by default. Specify the {@code -Dcom.linecorp.armeria.verboseResponses=true}
+     * JVM option to enable it.
+     */
+    public static boolean verboseResponses() {
+        return VERBOSE_RESPONSES;
     }
 
     /**
@@ -220,6 +278,17 @@ public final class Flags {
      */
     public static boolean useOpenSsl() {
         return USE_OPENSSL;
+    }
+
+    /**
+     * Returns the default server-side maximum number of connections.
+     *
+     * <p>The default value of this flag is {@value #DEFAULT_MAX_NUM_CONNECTIONS}. Specify the
+     * {@code -Dcom.linecorp.armeria.maxNumConnections=<integer>} JVM option to override
+     * the default value.
+     */
+    public static int maxNumConnections() {
+        return MAX_NUM_CONNECTIONS;
     }
 
     /**
@@ -371,8 +440,8 @@ public final class Flags {
      * Returns the default value of the {@link ClientFactoryBuilder#useHttp2Preface(boolean)} option.
      * Note that this value has effect only if a user did not specify it.
      *
-     * <p>This flag is disabled by default. Specify the
-     * {@code -Dcom.linecorp.armeria.defaultUseHttp2Preface=true} JVM option to enable it.
+     * <p>This flag is enabled by default. Specify the
+     * {@code -Dcom.linecorp.armeria.defaultUseHttp2Preface=false} JVM option to disable it.
      */
     public static boolean defaultUseHttp2Preface() {
         return DEFAULT_USE_HTTP2_PREFACE;
@@ -441,6 +510,30 @@ public final class Flags {
     }
 
     /**
+     * Returns the value of the {@code headerValueCache} parameter. It would be used to create a Caffeine
+     * {@link Cache} instance using {@link Caffeine#from(String)} mapping raw HTTP ascii header values to
+     * {@link String}.
+     *
+     * <p>The default value of this flag is {@value DEFAULT_HEADER_VALUE_CACHE_SPEC}. Specify the
+     * {@code -Dcom.linecorp.armeria.headerValueCache=<spec>} JVM option to override the default value.
+     * Also, specify {@code -Dcom.linecorp.armeria.headerValueCache=off} JVM option to disable it.
+     */
+    public static Optional<String> headerValueCacheSpec() {
+        return HEADER_VALUE_CACHE_SPEC;
+    }
+
+    /**
+     * Returns the value of the {@code cachedHeaders} parameter which contains a comma-separated list of
+     * headers whose values are cached using {@code headerValueCache}.
+     *
+     * <p>The default value of this flag is {@value DEFAULT_CACHED_HEADERS}. Specify the
+     * {@code -Dcom.linecorp.armeria.cachedHeaders=<csv>} JVM option to override the default value.
+     */
+    public static List<String> cachedHeaders() {
+        return CACHED_HEADERS;
+    }
+
+    /**
      * Returns the value of the {@code compositeServiceCache} parameter. It would be used to create a
      * Caffeine {@link Cache} instance using {@link Caffeine#from(String)} for routing a request.
      * The {@link Cache} would hold the mappings of {@link PathMappingContext} and the designated
@@ -452,6 +545,28 @@ public final class Flags {
      */
     public static Optional<String> compositeServiceCacheSpec() {
         return COMPOSITE_SERVICE_CACHE_SPEC;
+    }
+
+    /**
+     * Returns the verbosity of exceptions logged by annotated HTTP services. The value of this property
+     * is one of the following:
+     * <ul>
+     *     <li>{@link ExceptionVerbosity#ALL} - logging all exceptions raised from annotated HTTP services</li>
+     *     <li>{@link ExceptionVerbosity#UNHANDLED} - logging exceptions which are not handled by
+     *     {@link ExceptionHandler}s provided by a user and are not well-known exceptions
+     *     <li>{@link ExceptionVerbosity#NONE} - no logging exceptions</li>
+     * </ul>
+     * A log message would be written at {@code WARN} level.
+     *
+     * <p>The default value of this flag is {@value DEFAULT_ANNOTATED_SERVICE_EXCEPTION_VERBOSITY}.
+     * Specify the
+     * {@code -Dcom.linecorp.armeria.annotatedServiceExceptionVerbosity=<all|unhandled|none>} JVM option
+     * to override the default value.
+     *
+     * @see ExceptionVerbosity
+     */
+    public static ExceptionVerbosity annotatedServiceExceptionVerbosity() {
+        return ANNOTATED_SERVICE_EXCEPTION_VERBOSITY;
     }
 
     private static Optional<String> caffeineSpec(String name, String defaultValue) {
@@ -467,6 +582,13 @@ public final class Flags {
         });
         return "off".equals(spec) ? Optional.empty()
                                   : Optional.of(spec);
+    }
+
+    private static ExceptionVerbosity exceptionLoggingMode(String name, String defaultValue) {
+        final String mode = getNormalized(name, defaultValue,
+                                          value -> Arrays.stream(ExceptionVerbosity.values())
+                                                         .anyMatch(v -> v.name().equalsIgnoreCase(value)));
+        return ExceptionVerbosity.valueOf(mode.toUpperCase());
     }
 
     private static boolean getBoolean(String name, boolean defaultValue) {
@@ -543,6 +665,7 @@ public final class Flags {
         return defaultValue;
     }
 
+    @Nullable
     private static String getLowerCased(String fullName) {
         String value = System.getProperty(fullName);
         if (value != null) {

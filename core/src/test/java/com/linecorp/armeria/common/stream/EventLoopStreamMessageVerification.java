@@ -65,7 +65,7 @@ public class EventLoopStreamMessageVerification extends StreamMessageVerificatio
         stream.onDemand(() -> {
             for (;;) {
                 final long r = remaining.decrementAndGet();
-                final boolean written = stream.write(elements - r);
+                final boolean written = stream.tryWrite(elements - r);
                 if (r == 0) {
                     if (abort) {
                         stream.abort();
@@ -85,7 +85,7 @@ public class EventLoopStreamMessageVerification extends StreamMessageVerificatio
 
     @Override
     public StreamMessage<Long> createFailedPublisher() {
-        EventLoopStreamMessage<Long> stream = new EventLoopStreamMessage<Long>(eventLoop);
+        final EventLoopStreamMessage<Long> stream = new EventLoopStreamMessage<>(eventLoop);
         stream.subscribe(new NoopSubscriber<>());
         return stream;
     }

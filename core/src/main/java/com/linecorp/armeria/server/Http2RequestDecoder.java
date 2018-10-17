@@ -27,7 +27,7 @@ import com.linecorp.armeria.common.ClosedSessionException;
 import com.linecorp.armeria.common.ContentTooLargeException;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpMethod;
-import com.linecorp.armeria.common.HttpRequestWriter;
+import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.internal.ArmeriaHttpUtil;
 import com.linecorp.armeria.internal.InboundTrafficController;
@@ -37,6 +37,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http2.DefaultHttp2Headers;
 import io.netty.handler.codec.http2.Http2ConnectionEncoder;
@@ -46,6 +47,7 @@ import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.codec.http2.Http2Stream;
+import io.netty.util.AsciiString;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
 
@@ -97,8 +99,13 @@ final class Http2RequestDecoder extends Http2EventAdapter {
                 contentEmpty = true;
             }
 
+            if (!handle100Continue(ctx, streamId, headers)) {
+                writeErrorResponse(ctx, streamId, HttpResponseStatus.EXPECTATION_FAILED);
+                return;
+            }
+
             req = new DecodedHttpRequest(ctx.channel().eventLoop(), ++nextId, streamId,
-                                         ArmeriaHttpUtil.toArmeria(headers), true,
+                                         ArmeriaHttpUtil.toArmeria(headers, endOfStream), true,
                                          inboundTrafficController, cfg.defaultMaxRequestLength());
 
             // Close the request early when it is sure that there will be
@@ -111,7 +118,7 @@ final class Http2RequestDecoder extends Http2EventAdapter {
             ctx.fireChannelRead(req);
         } else {
             try {
-                req.write(ArmeriaHttpUtil.toArmeria(headers));
+                req.write(ArmeriaHttpUtil.toArmeria(headers, endOfStream));
             } catch (Throwable t) {
                 req.close(t);
                 throw connectionError(INTERNAL_ERROR, t, "failed to consume a HEADERS frame");
@@ -130,6 +137,29 @@ final class Http2RequestDecoder extends Http2EventAdapter {
             boolean endOfStream) throws Http2Exception {
 
         onHeadersRead(ctx, streamId, headers, padding, endOfStream);
+    }
+
+    private boolean handle100Continue(ChannelHandlerContext ctx, int streamId, Http2Headers headers) {
+        final CharSequence expectValue = headers.get(HttpHeaderNames.EXPECT);
+        if (expectValue == null) {
+            // No 'expect' header.
+            return true;
+        }
+
+        // '100-continue' is the only allowed expectation.
+        if (!AsciiString.contentEqualsIgnoreCase(HttpHeaderValues.CONTINUE, expectValue)) {
+            return false;
+        }
+
+        // Send a '100 Continue' response.
+        writer.writeHeaders(
+                ctx, streamId,
+                new DefaultHttp2Headers(false).status(HttpStatus.CONTINUE.codeAsText()),
+                0, false, ctx.voidPromise());
+
+        // Remove the 'expect' header so that it's handled in a way invisible to a Service.
+        headers.remove(HttpHeaderNames.EXPECT);
+        return true;
     }
 
     @Override
@@ -220,13 +250,13 @@ final class Http2RequestDecoder extends Http2EventAdapter {
 
     @Override
     public void onRstStreamRead(ChannelHandlerContext ctx, int streamId, long errorCode) throws Http2Exception {
-        final HttpRequestWriter req = requests.get(streamId);
+        final DecodedHttpRequest req = requests.get(streamId);
         if (req == null) {
             throw connectionError(PROTOCOL_ERROR,
                                   "received a RST_STREAM frame for an unknown stream: %d", streamId);
         }
 
-        req.close(streamError(
+        req.abortResponse(streamError(
                 streamId, Http2Error.valueOf(errorCode), "received a RST_STREAM frame"));
     }
 

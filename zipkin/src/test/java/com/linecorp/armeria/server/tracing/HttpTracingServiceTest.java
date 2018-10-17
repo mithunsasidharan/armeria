@@ -18,6 +18,7 @@ package com.linecorp.armeria.server.tracing;
 
 import static com.linecorp.armeria.common.SessionProtocol.H2C;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.Mockito.mock;
@@ -28,6 +29,7 @@ import static org.mockito.Mockito.when;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
+import org.junit.After;
 import org.junit.Test;
 
 import com.google.common.collect.ImmutableMap;
@@ -41,6 +43,7 @@ import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.logging.DefaultRequestLog;
 import com.linecorp.armeria.common.tracing.HelloService;
+import com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext;
 import com.linecorp.armeria.common.tracing.SpanCollectingReporter;
 import com.linecorp.armeria.server.Service;
 import com.linecorp.armeria.server.ServiceRequestContext;
@@ -57,16 +60,36 @@ public class HttpTracingServiceTest {
 
     private static final String TEST_METHOD = "hello";
 
+    @After
+    public void tearDown() {
+        Tracing.current().close();
+    }
+
+    @Test
+    public void newDecorator_shouldFailFastWhenRequestContextCurrentTraceContextNotConfigured() {
+        assertThatThrownBy(() -> HttpTracingService.newDecorator(Tracing.newBuilder().build()))
+                .isInstanceOf(IllegalStateException.class).hasMessage(
+                "Tracing.currentTraceContext is not a RequestContextCurrentTraceContext scope. " +
+                "Please call Tracing.Builder.currentTraceContext(RequestContextCurrentTraceContext.INSTANCE)."
+        );
+    }
+
+    @Test
+    public void newDecorator_shouldWorkWhenRequestContextCurrentTraceContextConfigured() {
+        HttpTracingService.newDecorator(
+                Tracing.newBuilder().currentTraceContext(RequestContextCurrentTraceContext.DEFAULT).build());
+    }
+
     @Test(timeout = 20000)
     public void shouldSubmitSpanWhenRequestIsSampled() throws Exception {
-        SpanCollectingReporter reporter = testServiceInvocation(1.0f);
+        final SpanCollectingReporter reporter = testServiceInvocation(1.0f);
 
         // check span name
-        Span span = reporter.spans().take();
+        final Span span = reporter.spans().take();
         assertThat(span.name()).isEqualTo(TEST_METHOD);
 
         // check kind
-        assertThat(span.kind() == Kind.SERVER);
+        assertThat(span.kind()).isSameAs(Kind.SERVER);
 
         // only one span should be submitted
         assertThat(reporter.spans().poll(1, TimeUnit.SECONDS)).isNull();
@@ -76,11 +99,11 @@ public class HttpTracingServiceTest {
 
         // check tags
         assertThat(span.tags()).containsAllEntriesOf(ImmutableMap.of(
-                "http.host", "localhost",
+                "http.host", "foo.com",
                 "http.method", "POST",
                 "http.path", "/hello/trustin",
                 "http.status_code", "200",
-                "http.url", "none+h2c://localhost/hello/trustin"));
+                "http.url", "none+h2c://foo.com/hello/trustin"));
 
         // check service name
         assertThat(span.localServiceName()).isEqualTo(TEST_SERVICE);
@@ -88,43 +111,43 @@ public class HttpTracingServiceTest {
 
     @Test
     public void shouldNotSubmitSpanWhenRequestIsNotSampled() throws Exception {
-        SpanCollectingReporter reporter = testServiceInvocation(0.0f);
+        final SpanCollectingReporter reporter = testServiceInvocation(0.0f);
 
         // don't submit any spans
         assertThat(reporter.spans().poll(1, TimeUnit.SECONDS)).isNull();
     }
 
     private static SpanCollectingReporter testServiceInvocation(float samplingRate) throws Exception {
-        SpanCollectingReporter reporter = new SpanCollectingReporter();
+        final SpanCollectingReporter reporter = new SpanCollectingReporter();
 
-        Tracing tracing = Tracing.newBuilder()
-                                 .localServiceName(TEST_SERVICE)
-                                 .spanReporter(reporter)
-                                 .sampler(Sampler.create(samplingRate))
-                                 .build();
+        final Tracing tracing = Tracing.newBuilder()
+                                       .localServiceName(TEST_SERVICE)
+                                       .spanReporter(reporter)
+                                       .sampler(Sampler.create(samplingRate))
+                                       .build();
 
         @SuppressWarnings("unchecked")
-        Service<HttpRequest, HttpResponse> delegate = mock(Service.class);
+        final Service<HttpRequest, HttpResponse> delegate = mock(Service.class);
 
         final HttpTracingService stub = new HttpTracingService(delegate, tracing);
 
         final ServiceRequestContext ctx = mock(ServiceRequestContext.class);
-        final HttpRequest req = HttpRequest.of(HttpMethod.POST, "/hello/trustin");
+        final HttpRequest req = HttpRequest.of(HttpHeaders.of(HttpMethod.POST, "/hello/trustin")
+                                                          .authority("foo.com"));
         final RpcRequest rpcReq = RpcRequest.of(HelloService.Iface.class, "hello", "trustin");
         final HttpResponse res = HttpResponse.of(HttpStatus.OK);
         final RpcResponse rpcRes = RpcResponse.of("Hello, trustin!");
         final DefaultRequestLog log = new DefaultRequestLog(ctx);
-        log.startRequest(mock(Channel.class), H2C, "localhost");
+        log.startRequest(mock(Channel.class), H2C);
+        log.requestHeaders(req.headers());
         log.requestContent(rpcReq, req);
         log.endRequest();
 
-        // HttpTracingService prefers RpcRequest.method() to ctx.method(), so "POST" should be ignored.
         when(ctx.method()).thenReturn(HttpMethod.POST);
         when(ctx.log()).thenReturn(log);
         when(ctx.logBuilder()).thenReturn(log);
         when(ctx.path()).thenReturn("/hello/trustin");
-        ctx.onEnter(isA(Consumer.class));
-        ctx.onExit(isA(Consumer.class));
+        checkCtxOnEnterAndExitParameter(ctx);
         when(delegate.serve(ctx, req)).thenReturn(res);
 
         // do invoke
@@ -136,5 +159,11 @@ public class HttpTracingServiceTest {
         log.endResponse();
 
         return reporter;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void checkCtxOnEnterAndExitParameter(ServiceRequestContext ctx) {
+        ctx.onEnter(isA(Consumer.class));
+        ctx.onExit(isA(Consumer.class));
     }
 }

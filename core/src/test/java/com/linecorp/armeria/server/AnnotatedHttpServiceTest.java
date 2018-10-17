@@ -16,17 +16,20 @@
 
 package com.linecorp.armeria.server;
 
-import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
@@ -47,6 +50,8 @@ import org.junit.Test;
 import org.junit.rules.TestWatcher;
 import org.junit.runner.Description;
 
+import com.google.common.collect.ImmutableList;
+
 import com.linecorp.armeria.common.AggregatedHttpMessage;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
@@ -63,7 +68,7 @@ import com.linecorp.armeria.server.TestConverters.NaiveStringConverterFunction;
 import com.linecorp.armeria.server.TestConverters.TypedNumberConverterFunction;
 import com.linecorp.armeria.server.TestConverters.TypedStringConverterFunction;
 import com.linecorp.armeria.server.TestConverters.UnformattedStringConverterFunction;
-import com.linecorp.armeria.server.annotation.ConsumeType;
+import com.linecorp.armeria.server.annotation.Consumes;
 import com.linecorp.armeria.server.annotation.Default;
 import com.linecorp.armeria.server.annotation.Get;
 import com.linecorp.armeria.server.annotation.Header;
@@ -71,8 +76,9 @@ import com.linecorp.armeria.server.annotation.Order;
 import com.linecorp.armeria.server.annotation.Param;
 import com.linecorp.armeria.server.annotation.Path;
 import com.linecorp.armeria.server.annotation.Post;
-import com.linecorp.armeria.server.annotation.ProduceType;
+import com.linecorp.armeria.server.annotation.Produces;
 import com.linecorp.armeria.server.annotation.ResponseConverter;
+import com.linecorp.armeria.server.annotation.ResponseConverterFunction;
 import com.linecorp.armeria.server.logging.LoggingService;
 import com.linecorp.armeria.testing.internal.AnticipatedException;
 import com.linecorp.armeria.testing.server.ServerRule;
@@ -137,14 +143,14 @@ public class AnnotatedHttpServiceTest {
         // Case 1: returns Integer type and handled by builder-default Integer -> HttpResponse converter.
         @Get
         @Path("/int/:var")
-        public int returnInt(@Param("var") int var) {
+        public int returnInt(@Param int var) {
             return var;
         }
 
         // Case 2: returns Long type and handled by class-default Number -> HttpResponse converter.
         @Post
         @Path("/long/{var}")
-        public CompletionStage<Long> returnLong(@Param("var") long var) {
+        public CompletionStage<Long> returnLong(@Param long var) {
             return CompletableFuture.supplyAsync(() -> var);
         }
 
@@ -152,20 +158,20 @@ public class AnnotatedHttpServiceTest {
         @Get
         @Path("/string/:var")
         @ResponseConverter(NaiveStringConverterFunction.class)
-        public CompletionStage<String> returnString(@Param("var") String var) {
+        public CompletionStage<String> returnString(@Param String var) {
             return CompletableFuture.supplyAsync(() -> var);
         }
 
         // Asynchronously returns Integer type and handled by builder-default Integer -> HttpResponse converter.
         @Get
         @Path("/int-async/:var")
-        public CompletableFuture<Integer> returnIntAsync(@Param("var") int var) {
+        public CompletableFuture<Integer> returnIntAsync(@Param int var) {
             return CompletableFuture.completedFuture(var).thenApply(n -> n + 1);
         }
 
         @Get
         @Path("/path/ctx/async/:var")
-        public static CompletableFuture<String> returnPathCtxAsync(@Param("var") int var,
+        public static CompletableFuture<String> returnPathCtxAsync(@Param int var,
                                                                    ServiceRequestContext ctx,
                                                                    Request req) {
             validateContextAndRequest(ctx, req);
@@ -174,7 +180,7 @@ public class AnnotatedHttpServiceTest {
 
         @Get
         @Path("/path/req/async/:var")
-        public static CompletableFuture<String> returnPathReqAsync(@Param("var") int var,
+        public static CompletableFuture<String> returnPathReqAsync(@Param int var,
                                                                    HttpRequest req,
                                                                    ServiceRequestContext ctx) {
             validateContextAndRequest(ctx, req);
@@ -183,7 +189,7 @@ public class AnnotatedHttpServiceTest {
 
         @Get
         @Path("/path/ctx/sync/:var")
-        public static String returnPathCtxSync(@Param("var") int var,
+        public static String returnPathCtxSync(@Param int var,
                                                RequestContext ctx,
                                                Request req) {
             validateContextAndRequest(ctx, req);
@@ -192,7 +198,7 @@ public class AnnotatedHttpServiceTest {
 
         @Get
         @Path("/path/req/sync/:var")
-        public static String returnPathReqSync(@Param("var") int var,
+        public static String returnPathReqSync(@Param int var,
                                                HttpRequest req,
                                                RequestContext ctx) {
             validateContextAndRequest(ctx, req);
@@ -202,15 +208,15 @@ public class AnnotatedHttpServiceTest {
         // Throws an exception synchronously
         @Get
         @Path("/exception/:var")
-        public int exception(@Param("var") int var) {
+        public int exception(@Param int var) {
             throw new AnticipatedException("bad var!");
         }
 
         // Throws an exception asynchronously
         @Get
         @Path("/exception-async/:var")
-        public CompletableFuture<Integer> exceptionAsync(@Param("var") int var) {
-            CompletableFuture<Integer> future = new CompletableFuture<>();
+        public CompletableFuture<Integer> exceptionAsync(@Param int var) {
+            final CompletableFuture<Integer> future = new CompletableFuture<>();
             future.completeExceptionally(new AnticipatedException("bad var!"));
             return future;
         }
@@ -219,6 +225,24 @@ public class AnnotatedHttpServiceTest {
         @Get("/warn/:var")
         public String warn() {
             return "warn";
+        }
+
+        @Get("/void/204")
+        public void void204() {}
+
+        @Get("/void/200")
+        @ResponseConverter(VoidTo200ResponseConverter.class)
+        public void void200() {}
+    }
+
+    static class VoidTo200ResponseConverter implements ResponseConverterFunction {
+        @Override
+        public HttpResponse convertResponse(ServiceRequestContext ctx, @Nullable Object result)
+                throws Exception {
+            if (result == null) {
+                return HttpResponse.of(HttpStatus.OK);
+            }
+            return ResponseConverterFunction.fallthrough();
         }
     }
 
@@ -254,6 +278,7 @@ public class AnnotatedHttpServiceTest {
             return Boolean.toString(var);
         }
 
+        @Nullable
         @Get("/null1")
         public Object returnNull1() {
             return null;
@@ -310,7 +335,7 @@ public class AnnotatedHttpServiceTest {
         @Path("/a/string-async2")
         public HttpResponse postStringAsync2(AggregatedHttpMessage message, RequestContext ctx) {
             validateContext(ctx);
-            HttpResponseWriter response = HttpResponse.streaming();
+            final HttpResponseWriter response = HttpResponse.streaming();
             response.write(HttpHeaders.of(HttpStatus.OK));
             response.write(message.content());
             response.close();
@@ -330,7 +355,7 @@ public class AnnotatedHttpServiceTest {
         public AggregatedHttpMessage postStringAggregateResponse2(HttpRequest req,
                                                                   RequestContext ctx) {
             validateContextAndRequest(ctx, req);
-            AggregatedHttpMessage message = req.aggregate().join();
+            final AggregatedHttpMessage message = req.aggregate().join();
             return AggregatedHttpMessage.of(HttpHeaders.of(HttpStatus.OK), message.content());
         }
     }
@@ -384,7 +409,7 @@ public class AnnotatedHttpServiceTest {
                                @Param("username") String username,
                                @Param("password") String password) {
             validateContext(ctx);
-            return username + "/" + password;
+            return username + '/' + password;
         }
 
         @Post("/param/post")
@@ -392,21 +417,21 @@ public class AnnotatedHttpServiceTest {
                                 @Param("username") String username,
                                 @Param("password") String password) {
             validateContext(ctx);
-            return username + "/" + password;
+            return username + '/' + password;
         }
 
         @Get
         @Path("/map/get")
         public String mapGet(RequestContext ctx, HttpParameters parameters) {
             validateContext(ctx);
-            return parameters.get("username") + "/" + parameters.get("password");
+            return parameters.get("username") + '/' + parameters.get("password");
         }
 
         @Post
         @Path("/map/post")
         public String mapPost(RequestContext ctx, HttpParameters parameters) {
             validateContext(ctx);
-            return parameters.get("username") + "/" + parameters.get("password");
+            return parameters.get("username") + '/' + parameters.get("password");
         }
 
         @Get("/param/enum")
@@ -414,15 +439,26 @@ public class AnnotatedHttpServiceTest {
                                 @Param("username") String username,
                                 @Param("level") UserLevel level) {
             validateContext(ctx);
-            return username + "/" + level;
+            return username + '/' + level;
         }
 
         @Get("/param/enum2")
         public String paramEnum2(RequestContext ctx,
-                                @Param("type") UserType type,
-                                @Param("level") UserLevel level) {
+                                 @Param("type") UserType type,
+                                 @Param("level") UserLevel level) {
             validateContext(ctx);
             return type + "/" + level;
+        }
+
+        @Get("/param/enum3")
+        public String paramEnum3(RequestContext ctx,
+                                 @Param("type") List<UserType> types,
+                                 @Param("level") Set<UserLevel> levels) {
+            validateContext(ctx);
+            return String.join("/",
+                               ImmutableList.builder().addAll(types).addAll(levels).build()
+                                            .stream().map(e -> ((Enum<?>) e).name())
+                                            .collect(Collectors.toList()));
         }
 
         @Get
@@ -434,7 +470,7 @@ public class AnnotatedHttpServiceTest {
                                     @Param("number") Optional<Integer> number) {
             // "extra" might be null because there is no default value specified.
             validateContext(ctx);
-            return username + "/" + password.get() + "/" + extra.orElse("(null)") +
+            return username + '/' + password.get() + '/' + extra.orElse("(null)") +
                    (number.isPresent() ? "/" + number.get() : "");
         }
 
@@ -444,7 +480,7 @@ public class AnnotatedHttpServiceTest {
                                     @Param("username") @Default("hello") String username,
                                     @Param("password") String password) {
             validateContext(ctx);
-            return username + "/" + password;
+            return username + '/' + password;
         }
 
         @Get
@@ -453,7 +489,7 @@ public class AnnotatedHttpServiceTest {
                                       @Param("username") String username,
                                       @Param("password") String password) {
             validateContext(ctx);
-            return username + "/" + password;
+            return username + '/' + password;
         }
     }
 
@@ -471,41 +507,41 @@ public class AnnotatedHttpServiceTest {
         }
 
         @Post("/same/path")
-        @ConsumeType("application/json")
+        @Consumes("application/json")
         public String sharedPostJson() {
             return "POST/JSON";
         }
 
         @Get("/same/path")
-        @ProduceType("application/json")
+        @Produces("application/json")
         public String sharedGetJson() {
             return "GET/JSON";
         }
 
         @Order(-1)
         @Get("/same/path")
-        @ProduceType("text/plain")
+        @Produces("text/plain")
         public String sharedGetText() {
             return "GET/TEXT";
         }
 
         @Post("/same/path")
-        @ConsumeType("application/json")
-        @ProduceType("application/json")
+        @Consumes("application/json")
+        @Produces("application/json")
         public String sharedPostJsonBoth() {
             return "POST/JSON/BOTH";
         }
 
         // To add one more produce type to the virtual host.
         @Get("/other")
-        @ProduceType("application/x-www-form-urlencoded")
+        @Produces("application/x-www-form-urlencoded")
         public String other() {
             return "GET/FORM";
         }
     }
 
-    @ProduceType("application/xml")
-    @ProduceType("application/json")
+    @Produces("application/xml")
+    @Produces("application/json")
     @ResponseConverter(UnformattedStringConverterFunction.class)
     public static class MyAnnotatedService9 {
 
@@ -515,8 +551,8 @@ public class AnnotatedHttpServiceTest {
         }
 
         @Post("/same/path")
-        @ConsumeType("application/xml")
-        @ConsumeType("application/json")
+        @Consumes("application/xml")
+        @Consumes("application/json")
         public String post() {
             return "POST";
         }
@@ -564,26 +600,50 @@ public class AnnotatedHttpServiceTest {
     public static class MyAnnotatedService11 {
 
         @Get("/aHeader")
-        public String aHeader(@Header("if-match") String ifMatch) {
+        public String aHeader(@Header String ifMatch) {
             if ("737060cd8c284d8af7ad3082f209582d".equalsIgnoreCase(ifMatch)) {
                 return "matched";
             }
             return "unMatched";
         }
 
-        @Post("/customHeader")
-        public String customHeader(@Header("a-name") String name) {
-            return name + " is awesome";
+        @Post("/customHeader1")
+        public String customHeader1(@Header List<String> aName) {
+            return String.join(":", aName) + " is awesome";
+        }
+
+        @Post("/customHeader2")
+        public String customHeader2(@Header Set<String> aName) {
+            return String.join(":", aName) + " is awesome";
+        }
+
+        @Post("/customHeader3")
+        public String customHeader3(@Header LinkedList<String> aName) {
+            return String.join(":", aName) + " is awesome";
+        }
+
+        @Post("/customHeader4")
+        public String customHeader3(@Header TreeSet<String> aName) {
+            return String.join(":", aName) + " is awesome";
+        }
+
+        @Post("/customHeader5")
+        public String customHeader5(@Header List<Integer> numbers,
+                                    @Header Set<String> strings) {
+            return String.join(":",
+                               numbers.stream()
+                                      .map(String::valueOf).collect(Collectors.toList())) + '/' +
+                   String.join(":", strings);
         }
 
         @Get("/headerDefault")
         public String headerDefault(RequestContext ctx,
-                                    @Header("username") @Default("hello") String username,
-                                    @Header("password") @Default("world") Optional<String> password,
-                                    @Header("extra") Optional<String> extra,
-                                    @Header("number") Optional<Integer> number) {
+                                    @Header @Default("hello") String username,
+                                    @Header @Default("world") Optional<String> password,
+                                    @Header Optional<String> extra,
+                                    @Header Optional<Integer> number) {
             validateContext(ctx);
-            return username + "/" + password.get() + "/" + extra.orElse("(null)") +
+            return username + '/' + password.get() + '/' + extra.orElse("(null)") +
                    (number.isPresent() ? "/" + number.get() : "");
         }
 
@@ -594,7 +654,7 @@ public class AnnotatedHttpServiceTest {
                                       @Param("extra") Optional<String> extra,
                                       @Param("number") int number) {
             validateContext(ctx);
-            return username + "/" + password.get() + "/" + extra.orElse("(null)") + "/" + number;
+            return username + '/' + password.get() + '/' + extra.orElse("(null)") + '/' + number;
         }
 
         @Get
@@ -603,7 +663,7 @@ public class AnnotatedHttpServiceTest {
                                          @Header("username") @Default("hello") String username,
                                          @Header("password") String password) {
             validateContext(ctx);
-            return username + "/" + password;
+            return username + '/' + password;
         }
     }
 
@@ -614,6 +674,8 @@ public class AnnotatedHttpServiceTest {
             testBody(hc, get("/1/int-async/42"), "Integer: 43");
             testBody(hc, post("/1/long/42"), "Number[42]");
             testBody(hc, get("/1/string/blah"), "String: blah");
+            testBody(hc, get("/1/string/%F0%90%8D%88"), "String: \uD800\uDF48", // 𐍈
+                     StandardCharsets.UTF_8);
 
             // Get a requested path as typed string from ServiceRequestContext or HttpRequest
             testBody(hc, get("/1/path/ctx/async/1"), "String[/1/path/ctx/async/1]");
@@ -707,6 +769,11 @@ public class AnnotatedHttpServiceTest {
             testBody(hc, get("/7/param/enum2?type=NORMAL&level=LV1"), "NORMAL/LV1");
             testStatusCode(hc, get("/7/param/enum2?type=MINOOX&level=LV1"), 400);
 
+            // Case sensitive test enum
+            testBody(hc, get("/7/param/enum3?type=normal&level=LV1&level=LV1"), "normal/LV1");
+            testBody(hc, get("/7/param/enum3?type=NORMAL&type=NORMAL&level=LV1"), "NORMAL/NORMAL/LV1");
+            testStatusCode(hc, get("/7/param/enum3?type=BAD&level=LV100"), 400);
+
             testBody(hc, get("/7/param/default1"), "hello/world/(null)");
             testBody(hc, get("/7/param/default1?extra=people&number=1"), "hello/world/people/1");
 
@@ -798,9 +865,30 @@ public class AnnotatedHttpServiceTest {
             request.setHeader(org.apache.http.HttpHeaders.IF_MATCH, "737060cd8c284d8af7ad3082f209582d");
             testBody(hc, request, "matched");
 
-            request = post("/11/customHeader");
+            request = post("/11/customHeader1");
             request.setHeader("a-name", "minwoox");
             testBody(hc, request, "minwoox is awesome");
+
+            for (int i = 1; i < 4; i++) {
+                request = post("/11/customHeader" + i);
+                request.addHeader("a-name", "minwoox");
+                request.addHeader("a-name", "giraffe");
+                testBody(hc, request, "minwoox:giraffe is awesome");
+            }
+
+            request = post("/11/customHeader4");
+            request.addHeader("a-name", "minwoox");
+            request.addHeader("a-name", "giraffe");
+            testBody(hc, request, "giraffe:minwoox is awesome");
+
+            request = post("/11/customHeader5");
+            request.addHeader("numbers", "1");
+            request.addHeader("numbers", "2");
+            request.addHeader("numbers", "1");
+            request.addHeader("strings", "minwoox");
+            request.addHeader("strings", "giraffe");
+            request.addHeader("strings", "minwoox");
+            testBody(hc, request, "1:2:1/minwoox:giraffe");
 
             request = get("/11/headerDefault");
             testBody(hc, request, "hello/world/(null)");
@@ -816,6 +904,14 @@ public class AnnotatedHttpServiceTest {
             testBody(hc, request, "trustin/hyangtack/people/2");
 
             testStatusCode(hc, get("/11/headerWithoutValue"), 400);
+        }
+    }
+
+    @Test
+    public void testReturnVoid() throws Exception {
+        try (CloseableHttpClient hc = HttpClients.createMinimal()) {
+            testStatusCode(hc, get("/1/void/204"), 204);
+            testBodyAndContentType(hc, get("/1/void/200"), "200 OK", MediaType.PLAIN_TEXT_UTF_8.toString());
         }
     }
 
@@ -867,20 +963,22 @@ public class AnnotatedHttpServiceTest {
                             @Nullable Charset encoding,
                             @Nullable String contentType) throws IOException {
         final HttpStatus status = HttpStatus.valueOf(statusCode);
-        assertThat(res.getStatusLine().toString(), is("HTTP/1.1 " + status));
+        assertThat(res.getStatusLine().toString()).isEqualTo(
+                "HTTP/1.1 " + status);
         if (body != null) {
             if (encoding != null) {
-                assertThat(EntityUtils.toString(res.getEntity(), encoding), is(body));
+                assertThat(EntityUtils.toString(res.getEntity(), encoding))
+                        .isEqualTo(body);
             } else {
-                assertThat(EntityUtils.toString(res.getEntity()), is(body));
+                assertThat(EntityUtils.toString(res.getEntity())).isEqualTo(body);
             }
         }
 
         final org.apache.http.Header header = res.getFirstHeader(org.apache.http.HttpHeaders.CONTENT_TYPE);
         if (contentType != null) {
-            assertThat(MediaType.parse(header.getValue()), is(MediaType.parse(contentType)));
+            assertThat(MediaType.parse(header.getValue())).isEqualTo(MediaType.parse(contentType));
         } else if (statusCode >= 400) {
-            assertThat(header.getValue(), is(MediaType.PLAIN_TEXT_UTF_8.toString()));
+            assertThat(header.getValue()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8.toString());
         } else {
             assert header == null;
         }
@@ -890,7 +988,7 @@ public class AnnotatedHttpServiceTest {
         return request(HttpMethod.GET, uri, null, null);
     }
 
-    static HttpRequestBase get(String uri, String accept) {
+    static HttpRequestBase get(String uri, @Nullable String accept) {
         return request(HttpMethod.GET, uri, null, accept);
     }
 
@@ -898,11 +996,11 @@ public class AnnotatedHttpServiceTest {
         return request(HttpMethod.POST, uri, null, null);
     }
 
-    static HttpRequestBase post(String uri, String contentType) {
+    static HttpRequestBase post(String uri, @Nullable String contentType) {
         return request(HttpMethod.POST, uri, contentType, null);
     }
 
-    static HttpRequestBase post(String uri, String contentType, String accept) {
+    static HttpRequestBase post(String uri, @Nullable String contentType, @Nullable String accept) {
         return request(HttpMethod.POST, uri, contentType, accept);
     }
 
@@ -910,7 +1008,7 @@ public class AnnotatedHttpServiceTest {
         return form(uri, null, "armeria", "armeria");
     }
 
-    static HttpPost form(String uri, Charset charset, String... kv) {
+    static HttpPost form(String uri, @Nullable Charset charset, String... kv) {
         final HttpPost req = (HttpPost) request(HttpMethod.POST, uri, MediaType.FORM_DATA.toString());
 
         final List<NameValuePair> params = new ArrayList<>();
@@ -924,11 +1022,12 @@ public class AnnotatedHttpServiceTest {
         return req;
     }
 
-    static HttpRequestBase request(HttpMethod method, String uri, String contentType) {
+    static HttpRequestBase request(HttpMethod method, String uri, @Nullable String contentType) {
         return request(method, uri, contentType, null);
     }
 
-    static HttpRequestBase request(HttpMethod method, String uri, String contentType, String accept) {
+    static HttpRequestBase request(HttpMethod method, String uri,
+                                   @Nullable String contentType, @Nullable String accept) {
         final HttpRequestBase req;
         switch (method) {
             case GET:

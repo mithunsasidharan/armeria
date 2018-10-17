@@ -19,7 +19,7 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 
 import javax.annotation.Nullable;
 
@@ -40,7 +40,7 @@ public final class RateLimitingThrottlingStrategy<T extends Request> extends Thr
     /**
      * Creates a new strategy with specified name.
      *
-     * @param requestPerSecond a number of requests per one second this {@link ThrottlingStrategy} accepts.
+     * @param requestPerSecond the number of requests per one second this {@link ThrottlingStrategy} accepts.
      */
     public RateLimitingThrottlingStrategy(double requestPerSecond, @Nullable String name) {
         super(name);
@@ -51,7 +51,7 @@ public final class RateLimitingThrottlingStrategy<T extends Request> extends Thr
     /**
      * Creates a new strategy.
      *
-     * @param requestPerSecond a number of requests per one second this {@link ThrottlingStrategy} accepts.
+     * @param requestPerSecond the number of requests per one second this {@link ThrottlingStrategy} accepts.
      */
     public RateLimitingThrottlingStrategy(double requestPerSecond) {
         this(requestPerSecond, null);
@@ -63,7 +63,7 @@ public final class RateLimitingThrottlingStrategy<T extends Request> extends Thr
     }
 
     @Override
-    public CompletableFuture<Boolean> accept(ServiceRequestContext ctx, T request) {
+    public CompletionStage<Boolean> accept(ServiceRequestContext ctx, T request) {
         return completedFuture(rateLimiter.tryAcquire());
     }
 }

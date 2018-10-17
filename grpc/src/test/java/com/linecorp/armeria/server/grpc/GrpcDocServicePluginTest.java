@@ -20,7 +20,9 @@ import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 import org.junit.Test;
@@ -29,7 +31,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.protobuf.Descriptors.ServiceDescriptor;
 
-import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
 import com.linecorp.armeria.grpc.testing.Messages.CompressionType;
 import com.linecorp.armeria.grpc.testing.Messages.ReconnectInfo;
@@ -41,9 +44,13 @@ import com.linecorp.armeria.grpc.testing.ReconnectServiceGrpc;
 import com.linecorp.armeria.grpc.testing.ReconnectServiceGrpc.ReconnectServiceImplBase;
 import com.linecorp.armeria.grpc.testing.TestServiceGrpc;
 import com.linecorp.armeria.grpc.testing.TestServiceGrpc.TestServiceImplBase;
+import com.linecorp.armeria.grpc.testing.UnitTestServiceGrpc;
+import com.linecorp.armeria.grpc.testing.UnitTestServiceGrpc.UnitTestServiceImplBase;
 import com.linecorp.armeria.protobuf.EmptyProtos.Empty;
 import com.linecorp.armeria.server.PathMapping;
 import com.linecorp.armeria.server.ServiceConfig;
+import com.linecorp.armeria.server.ServiceWithPathMappings;
+import com.linecorp.armeria.server.VirtualHost;
 import com.linecorp.armeria.server.VirtualHostBuilder;
 import com.linecorp.armeria.server.docs.EndpointInfo;
 import com.linecorp.armeria.server.docs.EnumInfo;
@@ -57,46 +64,61 @@ import com.linecorp.armeria.server.docs.StructInfo;
 import com.linecorp.armeria.server.docs.TypeSignature;
 import com.linecorp.armeria.server.grpc.GrpcDocServicePlugin.ServiceEntry;
 
-import io.netty.util.AsciiString;
-
 public class GrpcDocServicePluginTest {
 
     private static final ServiceDescriptor TEST_SERVICE_DESCRIPTOR =
             com.linecorp.armeria.grpc.testing.Test.getDescriptor()
                                                   .findServiceByName("TestService");
 
-    private GrpcDocServicePlugin generator = new GrpcDocServicePlugin();
+    private final GrpcDocServicePlugin generator = new GrpcDocServicePlugin();
 
     @Test
     public void services() throws Exception {
-        ServiceConfig testService = new ServiceConfig(
+        final VirtualHost vhost = new VirtualHostBuilder().build();
+        final Set<ServiceConfig> serviceCfgs = new HashSet<>();
+
+        // The case where a GrpcService is added to ServerBuilder without a prefix.
+        final ServiceWithPathMappings<HttpRequest, HttpResponse> prefixlessService =
+                new GrpcServiceBuilder().addService(mock(TestServiceImplBase.class)).build();
+        prefixlessService.pathMappings().forEach(
+                mapping -> serviceCfgs.add(new ServiceConfig(vhost, mapping, prefixlessService)));
+
+        // The case where a GrpcService is added to ServerBuilder with a prefix.
+        serviceCfgs.add(new ServiceConfig(
                 new VirtualHostBuilder().build(),
                 PathMapping.ofPrefix("/test"),
-                new GrpcServiceBuilder().addService(mock(TestServiceImplBase.class)).build());
+                new GrpcServiceBuilder().addService(mock(UnitTestServiceImplBase.class)).build()));
 
-        HttpHeaders testExampleHeaders = HttpHeaders.of(AsciiString.of("test"), "service");
-
-        ServiceConfig reconnectService = new ServiceConfig(
+        // Another GrpcService with a different prefix.
+        serviceCfgs.add(new ServiceConfig(
                 new VirtualHostBuilder().build(),
                 PathMapping.ofPrefix("/reconnect"),
-                new GrpcServiceBuilder().addService(mock(ReconnectServiceImplBase.class)).build());
+                new GrpcServiceBuilder().addService(mock(ReconnectServiceImplBase.class)).build()));
 
-        HttpHeaders reconnectExampleHeaders = HttpHeaders.of(AsciiString.of("reconnect"), "never");
-
-        ServiceSpecification specification = generator.generateSpecification(
-                ImmutableSet.of(testService, reconnectService));
-
-        Map<String, ServiceInfo> services = specification
+        // Make sure all services and their endpoints exist in the specification.
+        final ServiceSpecification specification = generator.generateSpecification(serviceCfgs);
+        final Map<String, ServiceInfo> services = specification
                 .services()
                 .stream()
                 .collect(toImmutableMap(ServiceInfo::name, Function.identity()));
         assertThat(services).containsOnlyKeys(TestServiceGrpc.SERVICE_NAME,
+                                              UnitTestServiceGrpc.SERVICE_NAME,
                                               ReconnectServiceGrpc.SERVICE_NAME);
+
+        services.get(TestServiceGrpc.SERVICE_NAME).methods().forEach(m -> m.endpoints().forEach(e -> {
+            assertThat(e.path()).isEqualTo("/armeria.grpc.testing.TestService/" + m.name());
+        }));
+        services.get(UnitTestServiceGrpc.SERVICE_NAME).methods().forEach(m -> m.endpoints().forEach(e -> {
+            assertThat(e.path()).isEqualTo("/test/armeria.grpc.testing.UnitTestService/" + m.name());
+        }));
+        services.get(ReconnectServiceGrpc.SERVICE_NAME).methods().forEach(m -> m.endpoints().forEach(e -> {
+            assertThat(e.path()).isEqualTo("/reconnect/armeria.grpc.testing.ReconnectService/" + m.name());
+        }));
     }
 
     @Test
     public void newEnumInfo() throws Exception {
-        EnumInfo enumInfo = generator.newEnumInfo(CompressionType.getDescriptor());
+        final EnumInfo enumInfo = generator.newEnumInfo(CompressionType.getDescriptor());
         assertThat(enumInfo).isEqualTo(new EnumInfo(
                 "armeria.grpc.testing.CompressionType",
                 ImmutableList.of(new EnumValueInfo("NONE"),
@@ -106,14 +128,14 @@ public class GrpcDocServicePluginTest {
 
     @Test
     public void newListInfo() throws Exception {
-        TypeSignature list = generator.newFieldTypeInfo(
+        final TypeSignature list = GrpcDocServicePlugin.newFieldTypeInfo(
                 ReconnectInfo.getDescriptor().findFieldByNumber(ReconnectInfo.BACKOFF_MS_FIELD_NUMBER));
         assertThat(list).isEqualTo(TypeSignature.ofContainer("repeated", GrpcDocServicePlugin.INT32));
     }
 
     @Test
     public void newMapInfo() throws Exception {
-        TypeSignature map = generator.newFieldTypeInfo(
+        final TypeSignature map = GrpcDocServicePlugin.newFieldTypeInfo(
                 StreamingOutputCallRequest.getDescriptor().findFieldByNumber(
                         StreamingOutputCallRequest.OPTIONS_FIELD_NUMBER));
         assertThat(map).isEqualTo(TypeSignature.ofMap(GrpcDocServicePlugin.STRING, GrpcDocServicePlugin.INT32));
@@ -121,7 +143,7 @@ public class GrpcDocServicePluginTest {
 
     @Test
     public void newMethodInfo() throws Exception {
-        MethodInfo methodInfo = generator.newMethodInfo(
+        final MethodInfo methodInfo = GrpcDocServicePlugin.newMethodInfo(
                 TEST_SERVICE_DESCRIPTOR.findMethodByName("UnaryCall"),
                 new ServiceEntry(
                         TEST_SERVICE_DESCRIPTOR,
@@ -155,7 +177,7 @@ public class GrpcDocServicePluginTest {
 
     @Test
     public void newServiceInfo() throws Exception {
-        ServiceInfo service = generator.newServiceInfo(
+        final ServiceInfo service = GrpcDocServicePlugin.newServiceInfo(
                 new ServiceEntry(
                         TEST_SERVICE_DESCRIPTOR,
                         ImmutableList.of(
@@ -166,12 +188,12 @@ public class GrpcDocServicePluginTest {
                                                  GrpcSerializationFormats.JSON,
                                                  ImmutableSet.of(GrpcSerializationFormats.JSON)))));
 
-        Map<String, MethodInfo> functions = service
+        final Map<String, MethodInfo> functions = service
                 .methods()
                 .stream()
                 .collect(toImmutableMap(MethodInfo::name, Function.identity()));
-        assertThat(functions).hasSize(7);
-        MethodInfo emptyCall = functions.get("EmptyCall");
+        assertThat(functions).hasSize(8);
+        final MethodInfo emptyCall = functions.get("EmptyCall");
         assertThat(emptyCall.name()).isEqualTo("EmptyCall");
         assertThat(emptyCall.parameters())
                 .containsExactly(
@@ -185,6 +207,7 @@ public class GrpcDocServicePluginTest {
         // Just sanity check that all methods are present, function conversion is more thoroughly tested in
         // newMethodInfo()
         assertThat(functions.get("UnaryCall").name()).isEqualTo("UnaryCall");
+        assertThat(functions.get("UnaryCall2").name()).isEqualTo("UnaryCall2");
         assertThat(functions.get("StreamingOutputCall").name()).isEqualTo("StreamingOutputCall");
         assertThat(functions.get("StreamingInputCall").name()).isEqualTo("StreamingInputCall");
         assertThat(functions.get("FullDuplexCall").name()).isEqualTo("FullDuplexCall");
@@ -194,7 +217,7 @@ public class GrpcDocServicePluginTest {
 
     @Test
     public void newStructInfo() throws Exception {
-        StructInfo structInfo = (StructInfo) generator.newStructInfo(TestMessage.getDescriptor());
+        final StructInfo structInfo = generator.newStructInfo(TestMessage.getDescriptor());
         assertThat(structInfo.name()).isEqualTo("armeria.grpc.testing.TestMessage");
         assertThat(structInfo.fields()).hasSize(18);
         assertThat(structInfo.fields().get(0).name()).isEqualTo("bool");

@@ -21,8 +21,9 @@ import static java.util.Objects.requireNonNull;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+
+import javax.annotation.Nullable;
 
 import org.jctools.queues.MpscChunkedArrayQueue;
 import org.reactivestreams.Subscriber;
@@ -66,7 +67,7 @@ public class DefaultStreamMessage<T> extends AbstractStreamMessageAndWriter<T> {
     @SuppressWarnings("rawtypes")
     private static final AtomicReferenceFieldUpdater<DefaultStreamMessage, SubscriptionImpl>
             subscriptionUpdater = AtomicReferenceFieldUpdater.newUpdater(
-                    DefaultStreamMessage.class, SubscriptionImpl.class, "subscription");
+            DefaultStreamMessage.class, SubscriptionImpl.class, "subscription");
 
     @SuppressWarnings("rawtypes")
     private static final AtomicReferenceFieldUpdater<DefaultStreamMessage, State> stateUpdater =
@@ -74,6 +75,7 @@ public class DefaultStreamMessage<T> extends AbstractStreamMessageAndWriter<T> {
 
     private final Queue<Object> queue;
 
+    @Nullable
     @SuppressWarnings("unused")
     private volatile SubscriptionImpl subscription; // set only via subscriptionUpdater
 
@@ -274,10 +276,7 @@ public class DefaultStreamMessage<T> extends AbstractStreamMessageAndWriter<T> {
 
         final SubscriptionImpl subscription = this.subscription;
         if (!invokedOnSubscribe) {
-            Executor executor = subscription.executor();
-            if (executor == null) {
-                executor = ForkJoinPool.commonPool();
-            }
+            final Executor executor = subscription.executor();
 
             // Subscriber.onSubscribe() was not invoked yet.
             // Reschedule the notification so that onSubscribe() is invoked before other events.
@@ -377,9 +376,21 @@ public class DefaultStreamMessage<T> extends AbstractStreamMessageAndWriter<T> {
             throw new IllegalArgumentException("cause: " + cause + " (must use Subscription.cancel())");
         }
 
+        tryClose(cause);
+    }
+
+    /**
+     * Tries to close the stream with the specified {@code cause}.
+     *
+     * @return {@code true} if the stream has been closed by this method call.
+     *         {@code false} if the stream has been closed already by other party.
+     */
+    protected final boolean tryClose(Throwable cause) {
         if (setState(State.OPEN, State.CLOSED)) {
             addObjectOrEvent(new CloseEvent(cause));
+            return true;
         }
+        return false;
     }
 
     private boolean setState(State oldState, State newState) {

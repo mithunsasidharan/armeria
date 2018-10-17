@@ -17,6 +17,7 @@
 package com.linecorp.armeria.server.grpc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.never;
@@ -25,9 +26,12 @@ import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.mockito.Mockito.when;
 
 import java.util.IdentityHashMap;
+import java.util.concurrent.CompletableFuture;
 
 import org.curioswitch.common.protobuf.json.MessageMarshaller;
+import org.junit.After;
 import org.junit.Before;
+import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.mockito.Mock;
@@ -35,9 +39,9 @@ import org.mockito.junit.MockitoJUnit;
 import org.mockito.junit.MockitoRule;
 import org.reactivestreams.Subscription;
 
+import com.linecorp.armeria.common.ClosedSessionException;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpResponseWriter;
-import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
 import com.linecorp.armeria.common.logging.DefaultRequestLog;
 import com.linecorp.armeria.grpc.testing.Messages.SimpleRequest;
@@ -46,6 +50,7 @@ import com.linecorp.armeria.grpc.testing.TestServiceGrpc;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer.ByteBufOrStream;
 import com.linecorp.armeria.internal.grpc.GrpcTestUtil;
 import com.linecorp.armeria.server.ServiceRequestContext;
+import com.linecorp.armeria.testing.common.EventLoopRule;
 import com.linecorp.armeria.unsafe.grpc.GrpcUnsafeBufferUtil;
 
 import io.grpc.CompressorRegistry;
@@ -56,7 +61,6 @@ import io.grpc.Status;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.ByteBufInputStream;
-import io.netty.util.AsciiString;
 import io.netty.util.Attribute;
 
 // TODO(anuraag): Currently only grpc-protobuf has been published so we only test proto here.
@@ -66,13 +70,8 @@ public class ArmeriaServerCallTest {
 
     private static final int MAX_MESSAGE_BYTES = 1024;
 
-    private static final HttpHeaders DEFAULT_RESPONSE_HEADERS =
-            HttpHeaders.of(HttpStatus.OK)
-                       .set(AsciiString.of("content-type"), "application/grpc+proto")
-                       .set(AsciiString.of("grpc-encoding"), "identity")
-                       .set(AsciiString.of("grpc-accept-encoding"),
-                            DecompressorRegistry.getDefaultInstance().getAdvertisedMessageEncodings())
-                       .asImmutable();
+    @ClassRule
+    public static final EventLoopRule eventLoop = new EventLoopRule();
 
     @Rule
     public MockitoRule mocks = MockitoJUnit.rule();
@@ -94,8 +93,15 @@ public class ArmeriaServerCallTest {
 
     private ArmeriaServerCall<SimpleRequest, SimpleResponse> call;
 
+    private CompletableFuture<Void> completionFuture;
+
     @Before
     public void setUp() {
+        completionFuture = new CompletableFuture<>();
+        when(res.completionFuture()).thenReturn(completionFuture);
+        when(ctx.eventLoop()).thenReturn(eventLoop.get());
+        when(ctx.contextAwareEventLoop()).thenReturn(eventLoop.get());
+
         when(ctx.alloc()).thenReturn(ByteBufAllocator.DEFAULT);
         call = new ArmeriaServerCall<>(
                 HttpHeaders.of(),
@@ -108,33 +114,50 @@ public class ArmeriaServerCallTest {
                 ctx,
                 GrpcSerializationFormats.PROTO,
                 MessageMarshaller.builder().build(),
-                false);
+                false,
+                "gzip");
         call.setListener(listener);
         call.messageReader().onSubscribe(subscription);
-        when(ctx.logBuilder()).thenReturn(new DefaultRequestLog(ctx));
+        final DefaultRequestLog log = new DefaultRequestLog(ctx);
+        when(ctx.log()).thenReturn(log);
+        when(ctx.logBuilder()).thenReturn(log);
         when(ctx.alloc()).thenReturn(ByteBufAllocator.DEFAULT);
         when(ctx.attr(GrpcUnsafeBufferUtil.BUFFERS)).thenReturn(buffersAttr);
     }
 
-    @Test
-    public void messageReadAfterClose_byteBuf() throws Exception {
-        call.close(Status.ABORTED, new Metadata());
-
-        call.messageRead(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
-
-        verify(listener, never()).onMessage(any());
+    @After
+    public void tearDown() {
+        // HttpStreamReader must be invoked from an event loop.
+        eventLoop.get().submit(() -> call.messageReader().cancel()).syncUninterruptibly();
+        if (!call.isCloseCalled()) {
+            call.close(Status.OK, new Metadata());
+        }
     }
 
     @Test
-    public void messageRead_notWrappedByteBuf() throws Exception {
-        ByteBuf buf = GrpcTestUtil.requestByteBuf();
+    public void messageReadAfterClose_byteBuf() {
+        call.close(Status.ABORTED, new Metadata());
+
+        // messageRead is always called from the event loop.
+        eventLoop.get().submit(() -> {
+            call.messageRead(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+
+            verify(listener, never()).onMessage(any());
+        }).syncUninterruptibly();
+    }
+
+    @Test
+    public void messageRead_notWrappedByteBuf() {
+        final ByteBuf buf = GrpcTestUtil.requestByteBuf();
         call.messageRead(new ByteBufOrStream(buf));
 
         verifyZeroInteractions(buffersAttr);
     }
 
     @Test
-    public void messageRead_wrappedByteBuf() throws Exception {
+    public void messageRead_wrappedByteBuf() {
+        tearDown();
+
         call = new ArmeriaServerCall<>(
                 HttpHeaders.of(),
                 TestServiceGrpc.getUnaryCallMethod(),
@@ -146,21 +169,25 @@ public class ArmeriaServerCallTest {
                 ctx,
                 GrpcSerializationFormats.PROTO,
                 MessageMarshaller.builder().build(),
-                true);
+                true,
+                "gzip");
 
-        ByteBuf buf = GrpcTestUtil.requestByteBuf();
+        final ByteBuf buf = GrpcTestUtil.requestByteBuf();
         call.messageRead(new ByteBufOrStream(buf));
 
         verify(buffersAttr).set(argThat(map -> map.containsValue(buf)));
     }
 
     @Test
-    public void messageReadAfterClose_stream() throws Exception {
+    public void messageReadAfterClose_stream() {
         call.close(Status.ABORTED, new Metadata());
 
-        call.messageRead(new ByteBufOrStream(new ByteBufInputStream(GrpcTestUtil.requestByteBuf(), true)));
+        // messageRead is always called from the event loop.
+        eventLoop.get().submit(() -> {
+            call.messageRead(new ByteBufOrStream(new ByteBufInputStream(GrpcTestUtil.requestByteBuf(), true)));
 
-        verify(listener, never()).onMessage(any());
+            verify(listener, never()).onMessage(any());
+        }).syncUninterruptibly();
     }
 
     @Test
@@ -173,6 +200,13 @@ public class ArmeriaServerCallTest {
     public void notReadyAfterClose() {
         assertThat(call.isReady()).isTrue();
         call.close(Status.OK, new Metadata());
-        assertThat(call.isReady()).isFalse();
+        await().untilAsserted(() -> assertThat(call.isReady()).isFalse());
+    }
+
+    @Test
+    public void closedIfCancelled() {
+        assertThat(call.isCancelled()).isFalse();
+        completionFuture.completeExceptionally(ClosedSessionException.get());
+        await().untilAsserted(() -> assertThat(call.isCancelled()).isTrue());
     }
 }

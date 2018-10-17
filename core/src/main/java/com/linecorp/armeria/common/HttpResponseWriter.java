@@ -16,14 +16,18 @@
 
 package com.linecorp.armeria.common;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.linecorp.armeria.internal.ArmeriaHttpUtil.isContentAlwaysEmpty;
 import static com.linecorp.armeria.internal.ArmeriaHttpUtil.isContentAlwaysEmptyWithValidation;
 import static java.util.Objects.requireNonNull;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Formatter;
 import java.util.Locale;
 
 import com.linecorp.armeria.common.stream.StreamWriter;
+
+import io.netty.util.ReferenceCountUtil;
 
 /**
  * An {@link HttpResponse} that can have {@link HttpObject}s written to it.
@@ -83,7 +87,7 @@ public interface HttpResponseWriter extends HttpResponse, StreamWriter<HttpObjec
      * {@linkplain Locale#ENGLISH English locale}.
      *
      * @param mediaType the {@link MediaType} of the response content
-     * @param format {@linkplain java.util.Formatter the format string} of the response content
+     * @param format {@linkplain Formatter the format string} of the response content
      * @param args the arguments referenced by the format specifiers in the format string
      *
      * @deprecated Use {@link HttpResponse#of(HttpStatus, MediaType, String, Object...)}.
@@ -173,6 +177,7 @@ public interface HttpResponseWriter extends HttpResponse, StreamWriter<HttpObjec
                            .setInt(HttpHeaderNames.CONTENT_LENGTH, content.length());
 
         if (isContentAlwaysEmptyWithValidation(status, content, trailingHeaders)) {
+            ReferenceCountUtil.safeRelease(content);
             write(headers);
         } else {
             write(headers);
@@ -208,10 +213,13 @@ public interface HttpResponseWriter extends HttpResponse, StreamWriter<HttpObjec
 
         final HttpHeaders headers = res.headers();
         final HttpStatus status = headers.status();
+        checkArgument(status != null, "res does not contain :status.");
+
         final HttpData content = res.content();
         final HttpHeaders trailingHeaders = res.trailingHeaders();
 
         if (isContentAlwaysEmptyWithValidation(status, content, trailingHeaders)) {
+            ReferenceCountUtil.safeRelease(content);
             write(headers);
         } else {
             write(headers);

@@ -41,6 +41,8 @@ import javax.annotation.Nullable;
 import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.HttpMethod;
+import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.Scheme;
@@ -65,8 +67,15 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
 
     private static final int STRING_BUILDER_CAPACITY = 512;
 
+    private static final HttpHeaders DUMMY_REQUEST_HEADERS_HTTP =
+            HttpHeaders.of().scheme("http").authority("?").method(HttpMethod.UNKNOWN).path("?").asImmutable();
+    private static final HttpHeaders DUMMY_REQUEST_HEADERS_HTTPS =
+            HttpHeaders.of().scheme("https").authority("?").method(HttpMethod.UNKNOWN).path("?").asImmutable();
+    private static final HttpHeaders DUMMY_RESPONSE_HEADERS = HttpHeaders.of(HttpStatus.UNKNOWN).asImmutable();
+
     private final RequestContext ctx;
 
+    @Nullable
     private List<RequestLog> children;
     private boolean hasLastChild;
 
@@ -83,29 +92,40 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
     private long requestStartTimeNanos;
     private long requestEndTimeNanos;
     private long requestLength;
+    @Nullable
     private Throwable requestCause;
 
     private long responseStartTimeMillis;
     private long responseStartTimeNanos;
     private long responseEndTimeNanos;
     private long responseLength;
+    @Nullable
     private Throwable responseCause;
 
+    @Nullable
     private Channel channel;
+    @Nullable
     private SessionProtocol sessionProtocol;
     private SerializationFormat serializationFormat = SerializationFormat.NONE;
+    @Nullable
     private String host;
 
-    private HttpHeaders requestHeaders = HttpHeaders.EMPTY_HEADERS;
-    private HttpHeaders responseHeaders = HttpHeaders.EMPTY_HEADERS;
+    private HttpHeaders requestHeaders = DUMMY_REQUEST_HEADERS_HTTP;
+    private HttpHeaders responseHeaders = DUMMY_RESPONSE_HEADERS;
+    @Nullable
     private Object requestContent;
+    @Nullable
     private Object rawRequestContent;
+    @Nullable
     private Object responseContent;
+    @Nullable
     private Object rawResponseContent;
 
     private volatile int requestStrFlags = -1;
     private volatile int responseStrFlags = -1;
+    @Nullable
     private String requestStr;
+    @Nullable
     private String responseStr;
 
     /**
@@ -130,7 +150,7 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
     private void propagateRequestSideLog(RequestLog child) {
         child.addListener(log -> {
             startRequest0(log.requestStartTimeNanos(), log.requestStartTimeMillis(), log.channel(),
-                          log.sessionProtocol(), log.host(), true);
+                          log.sessionProtocol(), true);
         }, REQUEST_START);
         child.addListener(log -> serializationFormat(log.serializationFormat()), SCHEME);
         child.addListener(log -> requestHeaders(log.requestHeaders()), REQUEST_HEADERS);
@@ -148,7 +168,7 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
     @Override
     public void endResponseWithLastChild() {
         checkState(!hasLastChild, "last child is already added");
-        checkState(!children.isEmpty(), "at least one child should be already added");
+        checkState(children != null && !children.isEmpty(), "at least one child should be already added");
         hasLastChild = true;
         final RequestLog lastChild = children.get(children.size() - 1);
         propagateResponseSideLog(lastChild);
@@ -289,21 +309,20 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
     }
 
     @Override
-    public void startRequest(Channel channel, SessionProtocol sessionProtocol, String host) {
+    public void startRequest(Channel channel, SessionProtocol sessionProtocol) {
         requireNonNull(channel, "channel");
         requireNonNull(sessionProtocol, "sessionProtocol");
-        requireNonNull(host, "host");
-        startRequest0(channel, sessionProtocol, host, true);
+        startRequest0(channel, sessionProtocol, true);
     }
 
-    private void startRequest0(Channel channel, SessionProtocol sessionProtocol,
-                               String host, boolean updateAvailability) {
-        startRequest0(System.nanoTime(), System.currentTimeMillis(), channel, sessionProtocol, host,
+    private void startRequest0(Channel channel, SessionProtocol sessionProtocol, boolean updateAvailability) {
+        startRequest0(System.nanoTime(), System.currentTimeMillis(), channel, sessionProtocol,
                       updateAvailability);
     }
 
-    private void startRequest0(long requestStartTimeNanos, long requestStartTimeMillis, Channel channel,
-                               SessionProtocol sessionProtocol, String host, boolean updateAvailability) {
+    private void startRequest0(long requestStartTimeNanos, long requestStartTimeMillis,
+                               @Nullable Channel channel, SessionProtocol sessionProtocol,
+                               boolean updateAvailability) {
         if (isAvailabilityAlreadyUpdated(REQUEST_START)) {
             return;
         }
@@ -312,7 +331,12 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
         this.requestStartTimeMillis = requestStartTimeMillis;
         this.channel = channel;
         this.sessionProtocol = sessionProtocol;
-        this.host = host;
+        if (sessionProtocol.isTls()) {
+            // Switch to the dummy headers with ':scheme=https' if the connection is TLS.
+            if (requestHeaders == DUMMY_REQUEST_HEADERS_HTTP) {
+                requestHeaders = DUMMY_REQUEST_HEADERS_HTTPS;
+            }
+        }
 
         if (updateAvailability) {
             updateAvailability(REQUEST_START);
@@ -359,12 +383,6 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
     public SessionProtocol sessionProtocol() {
         ensureAvailability(REQUEST_START);
         return sessionProtocol;
-    }
-
-    @Override
-    public String host() {
-        ensureAvailability(REQUEST_START);
-        return host;
     }
 
     @Override
@@ -483,11 +501,11 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
         endRequest0(requireNonNull(requestCause, "requestCause"));
     }
 
-    private void endRequest0(Throwable requestCause) {
+    private void endRequest0(@Nullable Throwable requestCause) {
         endRequest0(System.nanoTime(), requestCause);
     }
 
-    private void endRequest0(long requestEndTimeNanos, Throwable requestCause) {
+    private void endRequest0(long requestEndTimeNanos, @Nullable Throwable requestCause) {
         final int flags = requestCause == null && requestContentDeferred ? FLAGS_REQUEST_END_WITHOUT_CONTENT
                                                                          : REQUEST_END.setterFlags();
         if (isAvailable(flags)) {
@@ -497,7 +515,7 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
         // if the request is not started yet, call startRequest() with requestEndTimeNanos so that
         // totalRequestDuration will be 0
         startRequest0(requestEndTimeNanos, System.currentTimeMillis(), null,
-                      context().sessionProtocol(), null, false);
+                      context().sessionProtocol(), false);
 
         this.requestEndTimeNanos = requestEndTimeNanos;
         this.requestCause = requestCause;
@@ -617,12 +635,12 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
         }
 
         if (responseContent instanceof RpcResponse) {
-            RpcResponse rpcResponse = (RpcResponse) responseContent;
+            final RpcResponse rpcResponse = (RpcResponse) responseContent;
             if (!rpcResponse.isDone()) {
                 throw new IllegalArgumentException("responseContent must be complete: " + responseContent);
             }
             if (rpcResponse.cause() != null) {
-                this.responseCause = rpcResponse.cause();
+                responseCause = rpcResponse.cause();
             }
         }
 
@@ -660,11 +678,11 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
         endResponse0(requireNonNull(responseCause, "responseCause"));
     }
 
-    private void endResponse0(Throwable responseCause) {
+    private void endResponse0(@Nullable Throwable responseCause) {
         endResponse0(System.nanoTime(), responseCause);
     }
 
-    private void endResponse0(long responseEndTimeNanos, Throwable responseCause) {
+    private void endResponse0(long responseEndTimeNanos, @Nullable Throwable responseCause) {
         final int flags = responseCause == null && responseContentDeferred ? FLAGS_RESPONSE_END_WITHOUT_CONTENT
                                                                            : RESPONSE_END.setterFlags();
         if (isAvailable(flags)) {
@@ -709,6 +727,7 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
         }
     }
 
+    @Nullable
     private RequestLogListener[] removeSatisfiedListeners() {
         if (listeners.isEmpty()) {
             return null;
@@ -735,7 +754,7 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
         return satisfied;
     }
 
-    private void notifyListeners(RequestLogListener[] listeners) {
+    private void notifyListeners(@Nullable RequestLogListener[] listeners) {
         if (listeners == null) {
             return;
         }
@@ -816,7 +835,7 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
 
             buf.append(", host=").append(host);
 
-            if (isAvailable(flags, REQUEST_HEADERS) && requestHeaders != null) {
+            if (isAvailable(flags, REQUEST_HEADERS)) {
                 buf.append(", headers=").append(headersSanitizer.apply(requestHeaders));
             }
 
@@ -866,7 +885,7 @@ public class DefaultRequestLog implements RequestLog, RequestLogBuilder {
                 }
             }
 
-            if (isAvailable(flags, RESPONSE_HEADERS) && responseHeaders != null) {
+            if (isAvailable(flags, RESPONSE_HEADERS)) {
                 buf.append(", headers=").append(headersSanitizer.apply(responseHeaders));
             }
 

@@ -61,6 +61,9 @@ service TestService {
   // One request followed by one response.
   rpc UnaryCall(SimpleRequest) returns (SimpleResponse);
 
+  // Another method with one request followed by one response.
+  rpc UnaryCall2(SimpleRequest) returns (SimpleResponse);
+
   // One request followed by a sequence of responses (streamed download).
   // The server returns the payload with client desired type and sizes.
   rpc StreamingOutputCall(StreamingOutputCallRequest)
@@ -127,6 +130,10 @@ service UnitTestService {
 
     // A streaming RPC where the client cancels without explicitly closing the stream (e.g. socket disconnect).
     rpc StreamClientCancels(stream SimpleRequest) returns (stream SimpleResponse);
+
+    // A streaming RPC where the client half-closes but cancels without explicitly closing the stream
+    // before receiving the full response (e.g. socket disconnect).
+    rpc StreamClientCancelsBeforeResponseClosedCancels(SimpleRequest) returns (stream SimpleResponse);
 }
 
 // A simple service NOT implemented at servers so clients can test for

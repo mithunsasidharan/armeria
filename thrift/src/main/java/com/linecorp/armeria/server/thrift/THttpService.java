@@ -16,7 +16,6 @@
 
 package com.linecorp.armeria.server.thrift;
 
-import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.linecorp.armeria.common.util.Functions.voidFunction;
 import static java.util.Objects.requireNonNull;
 
@@ -39,18 +38,16 @@ import org.apache.thrift.meta_data.FieldMetaData;
 import org.apache.thrift.protocol.TMessage;
 import org.apache.thrift.protocol.TMessageType;
 import org.apache.thrift.protocol.TProtocol;
-import org.apache.thrift.protocol.TProtocolFactory;
-import org.apache.thrift.transport.TMemoryInputTransport;
 import org.apache.thrift.transport.TTransport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 
 import com.linecorp.armeria.common.AggregatedHttpMessage;
 import com.linecorp.armeria.common.DefaultRpcResponse;
+import com.linecorp.armeria.common.Flags;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
@@ -58,7 +55,6 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.SerializationFormat;
@@ -67,6 +63,7 @@ import com.linecorp.armeria.common.thrift.ThriftProtocolFactories;
 import com.linecorp.armeria.common.thrift.ThriftReply;
 import com.linecorp.armeria.common.thrift.ThriftSerializationFormats;
 import com.linecorp.armeria.common.util.CompletionActions;
+import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.common.util.SafeCloseable;
 import com.linecorp.armeria.internal.thrift.ThriftFieldAccess;
 import com.linecorp.armeria.internal.thrift.ThriftFunction;
@@ -76,6 +73,7 @@ import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.unsafe.ByteBufHttpData;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufHolder;
 
 /**
  * A {@link Service} that handles a Thrift call.
@@ -92,8 +90,7 @@ public final class THttpService extends AbstractHttpService {
             "Thrift protocol specified in Accept header must match " +
             "the one specified in the content-type header";
 
-    private static final Map<SerializationFormat, ThreadLocalTProtocol> FORMAT_TO_THREAD_LOCAL_INPUT_PROTOCOL =
-            createFormatToThreadLocalTProtocolMap();
+    private static final SerializationFormat[] EMPTY_FORMATS = new SerializationFormat[0];
 
     /**
      * Creates a new {@link THttpService} with the specified service implementation, supporting all thrift
@@ -354,7 +351,7 @@ public final class THttpService extends AbstractHttpService {
         final Set<SerializationFormat> set = new LinkedHashSet<>();
         set.add(defaultSerializationFormat);
         Iterables.addAll(set, otherAllowedSerializationFormats);
-        return set.toArray(new SerializationFormat[set.size()]);
+        return set.toArray(EMPTY_FORMATS);
     }
 
     private final Service<RpcRequest, RpcResponse> delegate;
@@ -418,16 +415,21 @@ public final class THttpService extends AbstractHttpService {
                                    MediaType.PLAIN_TEXT_UTF_8, ACCEPT_THRIFT_PROTOCOL_MUST_MATCH_CONTENT_TYPE);
         }
 
-        CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
-        HttpResponse res = HttpResponse.from(responseFuture);
+        final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
+        final HttpResponse res = HttpResponse.from(responseFuture);
         ctx.logBuilder().serializationFormat(serializationFormat);
         ctx.logBuilder().deferRequestContent();
-        req.aggregate().handle(voidFunction((aReq, cause) -> {
+        req.aggregateWithPooledObjects(ctx.eventLoop(), ctx.alloc()).handle(voidFunction((aReq, cause) -> {
             if (cause != null) {
-                responseFuture.complete(
-                        HttpResponse.of(
-                                HttpStatus.INTERNAL_SERVER_ERROR,
-                                MediaType.PLAIN_TEXT_UTF_8, Throwables.getStackTraceAsString(cause)));
+                final HttpResponse errorRes;
+                if (Flags.verboseResponses()) {
+                    errorRes = HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR,
+                                               MediaType.PLAIN_TEXT_UTF_8,
+                                               Exceptions.traceText(cause));
+                } else {
+                    errorRes = HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR);
+                }
+                responseFuture.complete(errorRes);
                 return;
             }
 
@@ -441,7 +443,7 @@ public final class THttpService extends AbstractHttpService {
         final HttpHeaders headers = req.headers();
         final MediaType contentType = headers.contentType();
 
-        SerializationFormat serializationFormat;
+        final SerializationFormat serializationFormat;
         if (contentType != null) {
             serializationFormat = findSerializationFormat(contentType);
             if (serializationFormat == null) {
@@ -453,7 +455,7 @@ public final class THttpService extends AbstractHttpService {
         return serializationFormat;
     }
 
-    private boolean validateAcceptHeaders(HttpRequest req, SerializationFormat serializationFormat) {
+    private static boolean validateAcceptHeaders(HttpRequest req, SerializationFormat serializationFormat) {
         // If accept header is present, make sure it is sane. Currently, we do not support accept
         // headers with a different format than the content type header.
         final List<String> acceptHeaders = req.headers().getAll(HttpHeaderNames.ACCEPT);
@@ -464,6 +466,7 @@ public final class THttpService extends AbstractHttpService {
         return true;
     }
 
+    @Nullable
     private SerializationFormat findSerializationFormat(MediaType contentType) {
 
         for (SerializationFormat format : allowedSerializationFormatArray) {
@@ -478,12 +481,17 @@ public final class THttpService extends AbstractHttpService {
     private void decodeAndInvoke(
             ServiceRequestContext ctx, AggregatedHttpMessage req,
             SerializationFormat serializationFormat, CompletableFuture<HttpResponse> httpRes) {
-
-        final TProtocol inProto = FORMAT_TO_THREAD_LOCAL_INPUT_PROTOCOL.get(serializationFormat).get();
-        inProto.reset();
-        final TMemoryInputTransport inTransport = (TMemoryInputTransport) inProto.getTransport();
         final HttpData content = req.content();
-        inTransport.reset(content.array(), content.offset(), content.length());
+        final ByteBuf buf;
+        if (content instanceof ByteBufHolder) {
+            buf = ((ByteBufHolder) content).content();
+        } else {
+            buf = ctx.alloc().buffer(content.length());
+            buf.writeBytes(content.array(), content.offset(), content.length());
+        }
+
+        final TByteBufTransport inTransport = new TByteBufTransport(buf);
+        final TProtocol inProto = ThriftProtocolFactories.get(serializationFormat).getProtocol(inTransport);
 
         final int seqId;
         final ThriftFunction f;
@@ -496,12 +504,19 @@ public final class THttpService extends AbstractHttpService {
             try {
                 header = inProto.readMessageBegin();
             } catch (Exception e) {
-                logger.debug("{} Failed to decode Thrift header:", ctx, e);
-                httpRes.complete(
-                        HttpResponse.of(
-                                HttpStatus.BAD_REQUEST,
-                                MediaType.PLAIN_TEXT_UTF_8,
-                                "Failed to decode Thrift header: " + Throwables.getStackTraceAsString(e)));
+                logger.debug("{} Failed to decode a {} header:", ctx, serializationFormat, e);
+
+                final HttpResponse errorRes;
+                if (Flags.verboseResponses()) {
+                    errorRes = HttpResponse.of(HttpStatus.BAD_REQUEST, MediaType.PLAIN_TEXT_UTF_8,
+                                               "Failed to decode a %s header: %s", serializationFormat,
+                                               Exceptions.traceText(e));
+                } else {
+                    errorRes = HttpResponse.of(HttpStatus.BAD_REQUEST, MediaType.PLAIN_TEXT_UTF_8,
+                                               "Failed to decode a %s header", serializationFormat);
+                }
+
+                httpRes.complete(errorRes);
                 return;
             }
 
@@ -559,7 +574,7 @@ public final class THttpService extends AbstractHttpService {
                 return;
             }
         } finally {
-            inTransport.clear();
+            buf.release();
             ctx.logBuilder().requestContent(null, null);
         }
 
@@ -587,7 +602,7 @@ public final class THttpService extends AbstractHttpService {
 
         final RpcResponse reply;
 
-        try (SafeCloseable ignored = RequestContext.push(ctx)) {
+        try (SafeCloseable ignored = ctx.push()) {
             reply = delegate.serve(ctx, call);
         } catch (Throwable cause) {
             handleException(ctx, new DefaultRpcResponse(cause), res, serializationFormat, seqId, func, cause);
@@ -726,12 +741,18 @@ public final class THttpService extends AbstractHttpService {
         if (cause instanceof TApplicationException) {
             appException = (TApplicationException) cause;
         } else {
-            appException = new TApplicationException(
-                    TApplicationException.INTERNAL_ERROR,
-                    "internal server error:" + System.lineSeparator() +
-                    "---- BEGIN server-side trace ----" + System.lineSeparator() +
-                    Throwables.getStackTraceAsString(cause) +
-                    "---- END server-side trace ----");
+            if (Flags.verboseResponses()) {
+                appException = new TApplicationException(
+                        TApplicationException.INTERNAL_ERROR,
+                        "\n---- BEGIN server-side trace ----\n" +
+                        Exceptions.traceText(cause) +
+                        "---- END server-side trace ----");
+            } else {
+                appException = new TApplicationException(TApplicationException.INTERNAL_ERROR);
+            }
+
+            // Causes are not sent over the wire but just used for RequestLog.
+            appException.initCause(cause);
         }
 
         final ByteBuf buf = ctx.alloc().buffer(128);
@@ -755,26 +776,6 @@ public final class THttpService extends AbstractHttpService {
             if (!success) {
                 buf.release();
             }
-        }
-    }
-
-    private static Map<SerializationFormat, ThreadLocalTProtocol> createFormatToThreadLocalTProtocolMap() {
-        return ThriftSerializationFormats.values().stream().collect(
-                toImmutableMap(Function.identity(),
-                               f -> new ThreadLocalTProtocol(ThriftProtocolFactories.get(f))));
-    }
-
-    private static final class ThreadLocalTProtocol extends ThreadLocal<TProtocol> {
-
-        private final TProtocolFactory protoFactory;
-
-        private ThreadLocalTProtocol(TProtocolFactory protoFactory) {
-            this.protoFactory = protoFactory;
-        }
-
-        @Override
-        protected TProtocol initialValue() {
-            return protoFactory.getProtocol(new TMemoryInputTransport());
         }
     }
 }

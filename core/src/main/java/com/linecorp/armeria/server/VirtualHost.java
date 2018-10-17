@@ -61,20 +61,35 @@ public final class VirtualHost {
     /**
      * Initialized later by {@link ServerConfig} via {@link #setServerConfig(ServerConfig)}.
      */
+    @Nullable
     private ServerConfig serverConfig;
 
     private final String defaultHostname;
     private final String hostnamePattern;
+    @Nullable
     private final SslContext sslContext;
     private final List<ServiceConfig> services;
     private final Router<ServiceConfig> router;
     private final MediaTypeSet producibleMediaTypes;
 
+    @Nullable
     private String strVal;
 
+    /**
+     * Use this constructor when you are sure that the {@link ServiceConfig}s have no duplicate
+     * {@link PathMapping}s or it's OK to have them. This is useful when you create a new {@link VirtualHost}
+     * from an existing {@link VirtualHost}, because its {@link ServiceConfig}s were validated already.
+     */
     VirtualHost(String defaultHostname, String hostnamePattern,
-                SslContext sslContext, Iterable<ServiceConfig> serviceConfigs,
+                @Nullable SslContext sslContext, Iterable<ServiceConfig> serviceConfigs,
                 MediaTypeSet producibleMediaTypes) {
+        this(defaultHostname, hostnamePattern, sslContext, serviceConfigs, producibleMediaTypes,
+             (virtualHost, mapping, existingMapping) -> {});
+    }
+
+    VirtualHost(String defaultHostname, String hostnamePattern,
+                @Nullable SslContext sslContext, Iterable<ServiceConfig> serviceConfigs,
+                MediaTypeSet producibleMediaTypes, RejectedPathMappingHandler rejectionHandler) {
 
         defaultHostname = normalizeDefaultHostname(defaultHostname);
         hostnamePattern = normalizeHostnamePattern(hostnamePattern);
@@ -95,7 +110,7 @@ public final class VirtualHost {
         }
 
         services = Collections.unmodifiableList(servicesCopy);
-        router = Routers.ofVirtualHost(services);
+        router = Routers.ofVirtualHost(this, services, rejectionHandler);
     }
 
     /**
@@ -155,7 +170,7 @@ public final class VirtualHost {
     private static boolean needsNormalization(String hostnamePattern) {
         final int length = hostnamePattern.length();
         for (int i = 0; i < length; i++) {
-            int c = hostnamePattern.charAt(i);
+            final int c = hostnamePattern.charAt(i);
             if (c > 0x7F) {
                 return true;
             }
@@ -163,7 +178,8 @@ public final class VirtualHost {
         return false;
     }
 
-    static SslContext validateSslContext(SslContext sslContext) {
+    @Nullable
+    static SslContext validateSslContext(@Nullable SslContext sslContext) {
         if (sslContext != null && !sslContext.isServer()) {
             throw new IllegalArgumentException("sslContext: " + sslContext + " (expected: server context)");
         }
@@ -211,6 +227,7 @@ public final class VirtualHost {
     /**
      * Returns the {@link SslContext} of this virtual host.
      */
+    @Nullable
     public SslContext sslContext() {
         return sslContext;
     }
@@ -276,10 +293,10 @@ public final class VirtualHost {
         return strVal;
     }
 
-    static String toString(Class<?> type, String defaultHostname, String hostnamePattern,
-                           SslContext sslContext, List<?> services) {
+    static String toString(@Nullable Class<?> type, String defaultHostname, String hostnamePattern,
+                           @Nullable SslContext sslContext, List<?> services) {
 
-        StringBuilder buf = new StringBuilder();
+        final StringBuilder buf = new StringBuilder();
         if (type != null) {
             buf.append(type.getSimpleName());
         }

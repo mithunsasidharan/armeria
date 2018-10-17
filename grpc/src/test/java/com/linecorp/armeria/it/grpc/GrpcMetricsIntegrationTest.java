@@ -37,10 +37,14 @@ import com.google.protobuf.ByteString;
 import com.linecorp.armeria.client.ClientBuilder;
 import com.linecorp.armeria.client.ClientFactory;
 import com.linecorp.armeria.client.ClientFactoryBuilder;
+import com.linecorp.armeria.client.HttpClient;
 import com.linecorp.armeria.client.metric.MetricCollectingClient;
+import com.linecorp.armeria.common.Flags;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.common.SerializationFormat;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
 import com.linecorp.armeria.common.metric.MeterIdPrefix;
 import com.linecorp.armeria.common.metric.MeterIdPrefixFunction;
@@ -74,6 +78,16 @@ public class GrpcMetricsIntegrationTest {
             }
             responseObserver.onError(new IllegalArgumentException("bad argument"));
         }
+
+        @Override
+        public void unaryCall2(SimpleRequest request, StreamObserver<SimpleResponse> responseObserver) {
+            if ("world".equals(request.getPayload().getBody().toStringUtf8())) {
+                responseObserver.onNext(SimpleResponse.getDefaultInstance());
+                responseObserver.onCompleted();
+                return;
+            }
+            responseObserver.onError(new IllegalArgumentException("bad argument"));
+        }
     }
 
     @ClassRule
@@ -81,7 +95,6 @@ public class GrpcMetricsIntegrationTest {
         @Override
         protected void configure(ServerBuilder sb) throws Exception {
             sb.meterRegistry(registry);
-            sb.port(0, SessionProtocol.HTTP);
             sb.serviceUnder("/", new GrpcServiceBuilder()
                          .addService(new TestServiceImpl())
                          .enableUnframedRequests(true)
@@ -114,22 +127,56 @@ public class GrpcMetricsIntegrationTest {
 
         // Chance that get() returns NPE before the metric is first added, so ignore exceptions.
         given().ignoreExceptions().untilAsserted(() -> assertThat(
-                findServerMeter("UnaryCall", "requests", COUNT, "result", "success")).contains(4.0));
+                findServerMeter("UnaryCall", "requests", COUNT, "result", "success", "httpStatus", "200"))
+                .contains(4.0));
         given().ignoreExceptions().untilAsserted(() -> assertThat(
-                findServerMeter("UnaryCall", "requests", COUNT, "result", "failure")).contains(3.0));
+                findServerMeter("UnaryCall", "requests", COUNT, "result", "failure", "httpStatus", "200"))
+                .contains(3.0));
         given().ignoreExceptions().untilAsserted(() -> assertThat(
                 findClientMeter("UnaryCall", "requests", COUNT, "result", "success")).contains(4.0));
         given().ignoreExceptions().untilAsserted(() -> assertThat(
                 findClientMeter("UnaryCall", "requests", COUNT, "result", "failure")).contains(3.0));
 
-        assertThat(findServerMeter("UnaryCall", "requestLength", COUNT)).contains(7.0);
-        assertThat(findServerMeter("UnaryCall", "requestLength", TOTAL)).contains(7.0 * 14);
+        assertThat(findServerMeter("UnaryCall", "requestLength", COUNT, "httpStatus", "200")).contains(7.0);
+        assertThat(findServerMeter("UnaryCall", "requestLength", TOTAL, "httpStatus", "200"))
+                .contains(7.0 * 14);
         assertThat(findClientMeter("UnaryCall", "requestLength", COUNT)).contains(7.0);
         assertThat(findClientMeter("UnaryCall", "requestLength", TOTAL)).contains(7.0 * 14);
-        assertThat(findServerMeter("UnaryCall", "responseLength", COUNT)).contains(7.0);
-        assertThat(findServerMeter("UnaryCall", "responseLength", TOTAL)).contains(4.0 * 5 /* + 3 * 0 */);
+        assertThat(findServerMeter("UnaryCall", "responseLength", COUNT, "httpStatus", "200")).contains(7.0);
+        assertThat(findServerMeter("UnaryCall", "responseLength", TOTAL, "httpStatus", "200"))
+                .contains(4.0 * 5 /* + 3 * 0 */);
         assertThat(findClientMeter("UnaryCall", "responseLength", COUNT)).contains(7.0);
         assertThat(findClientMeter("UnaryCall", "responseLength", TOTAL)).contains(4.0 * 5 /* + 3 * 0 */);
+    }
+
+    @Test
+    public void unframed() throws Exception {
+        makeUnframedRequest("world");
+        makeUnframedRequest("world");
+        makeUnframedRequest("space");
+        makeUnframedRequest("world");
+        makeUnframedRequest("space");
+        makeUnframedRequest("space");
+        makeUnframedRequest("world");
+
+        // Chance that get() returns NPE before the metric is first added, so ignore exceptions.
+        given().ignoreExceptions().untilAsserted(() -> assertThat(
+                findServerMeter("UnaryCall2", "requests", COUNT, "result", "success", "httpStatus", "200"))
+                .contains(4.0));
+        given().ignoreExceptions().untilAsserted(() -> assertThat(
+                findServerMeter("UnaryCall2", "requests", COUNT, "result", "failure", "httpStatus", "500"))
+                .contains(3.0));
+        assertThat(findServerMeter("UnaryCall2", "responseLength", COUNT, "httpStatus", "200")).contains(4.0);
+        assertThat(findServerMeter("UnaryCall2", "responseLength", COUNT, "httpStatus", "500")).contains(3.0);
+        assertThat(findServerMeter("UnaryCall2", "responseLength", TOTAL, "httpStatus", "200")).contains(0.0);
+        assertThat(findServerMeter("UnaryCall2", "responseLength", TOTAL, "httpStatus", "500"))
+                .hasValueSatisfying(value -> {
+                    if (Flags.verboseResponses()) {
+                        assertThat(value).isGreaterThan(225.0); // As larger as the stack trace
+                    } else {
+                        assertThat(value).isEqualTo(225.0);
+                    }
+                });
     }
 
     private static Optional<Double> findServerMeter(
@@ -147,26 +194,46 @@ public class GrpcMetricsIntegrationTest {
             String method, String suffix, Statistic type, String... keyValues) {
         final MeterIdPrefix prefix = new MeterIdPrefix(
                 "client." + suffix + '#' + type.getTagValueRepresentation(),
-                "method", "armeria.grpc.testing.TestService/" + method);
+                "method", "armeria.grpc.testing.TestService/" + method,
+                "httpStatus", "200");
         final String meterIdStr = prefix.withTags(keyValues).toString();
         return Optional.ofNullable(MoreMeters.measureAll(registry).get(meterIdStr));
     }
 
     private static void makeRequest(String name) throws Exception {
-        TestServiceBlockingStub client = new ClientBuilder(server.uri(GrpcSerializationFormats.PROTO, "/"))
+        final String uri = server.uri(GrpcSerializationFormats.PROTO, "/");
+        final TestServiceBlockingStub client = new ClientBuilder(uri)
                 .factory(clientFactory)
                 .decorator(HttpRequest.class, HttpResponse.class,
                            MetricCollectingClient.newDecorator(
                                    MeterIdPrefixFunction.ofDefault("client")))
                 .build(TestServiceBlockingStub.class);
 
-        SimpleRequest request =
+        final SimpleRequest request =
                 SimpleRequest.newBuilder()
                              .setPayload(Payload.newBuilder()
                                                 .setBody(ByteString.copyFromUtf8(name)))
                              .build();
         try {
             client.unaryCall(request);
+        } catch (Throwable t) {
+            // Ignore, we will count these up
+        }
+    }
+
+    private static void makeUnframedRequest(String name) throws Exception {
+        final HttpClient client = new ClientBuilder(server.uri(SerializationFormat.NONE, "/"))
+                .factory(clientFactory)
+                .addHttpHeader(HttpHeaderNames.CONTENT_TYPE, MediaType.PROTOBUF.toString())
+                .build(HttpClient.class);
+
+        final SimpleRequest request =
+                SimpleRequest.newBuilder()
+                             .setPayload(Payload.newBuilder()
+                                                .setBody(ByteString.copyFromUtf8(name)))
+                             .build();
+        try {
+            client.post("/armeria.grpc.testing.TestService/UnaryCall2", request.toByteArray());
         } catch (Throwable t) {
             // Ignore, we will count these up
         }
